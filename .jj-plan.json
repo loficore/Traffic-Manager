@@ -1,0 +1,23 @@
+{
+  "batches": [
+    {
+      "message": "feat(backend): 核心后端代码实现",
+      "paths": [
+        "backend/build.zig",
+        "backend/build.zig.zon",
+        "backend/src/main.zig",
+        "backend/src/root.zig",
+        "backend/src/storage.zig",
+        "backend/src/traffic.zig"
+      ]
+    },
+    {
+      "message": "feat(frontend): 前端代码和项目配置",
+      "paths": [
+        "frontend/index.ts",
+        "frontend/package.json",
+        ".gitignore"
+      ]
+    }
+  ]
+}
