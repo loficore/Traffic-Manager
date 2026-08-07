@@ -8,8 +8,19 @@
 const std = @import("std");
 pub const traffic = @import("traffic.zig");
 pub const storage = @import("storage.zig");
+pub const sqlite_storage = @import("sqlite_storage.zig");
+pub const pidfile = @import("pidfile.zig");
+pub const daemon = @import("daemon.zig");
+pub const log = @import("log.zig");
+pub const sqlite_schema = @import("sqlite_schema.zig");
 
 const Allocator = std.mem.Allocator;
+
+/// 存储后端标签
+const StorageBackend = union(enum) {
+    file: *storage.Storage,
+    sqlite: *sqlite_storage.SQLiteStorage,
+};
 
 pub const AppConfig = struct {
     /// 采样间隔时间（秒），默认 1 秒
@@ -22,6 +33,18 @@ pub const AppConfig = struct {
     day_count: u32 = 0,
     /// -d/--duration 是否被显式指定
     interval_explicit: bool = false,
+    /// 以守护进程模式运行
+    daemon_mode: bool = false,
+    /// 强制前台运行（与 --daemon 互斥）
+    foreground: bool = false,
+    /// 日志文件路径
+    log_file: ?[]const u8 = null,
+    /// PID 文件路径
+    pid_file: ?[]const u8 = null,
+    /// 历史记录保留天数
+    retention_days: u32 = 30,
+    /// 使用 SQLite 存储
+    use_sqlite: bool = false,
 };
 
 pub fn parseArgs(allocator: Allocator, args_vec: std.process.Args) !AppConfig {
@@ -70,11 +93,59 @@ pub fn parseArgs(allocator: Allocator, args_vec: std.process.Args) !AppConfig {
                 return error.InvalidArgumentValue;
             };
         }
+        // 守护进程模式（无短标志，避免与 -D 冲突）
+        else if (std.mem.eql(u8, arg, "--daemon")) {
+            config.daemon_mode = true;
+        }
+        // 强制前台运行
+        else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--foreground")) {
+            config.foreground = true;
+        }
+        // 日志文件路径
+        else if (std.mem.eql(u8, arg, "--log-file")) {
+            const val_str = args.next() orelse {
+                std.debug.print("错误: --log-file 选项缺少参数值\n", .{});
+                return error.MissingArgumentValue;
+            };
+            config.log_file = try allocator.dupe(u8, val_str);
+        }
+        // PID 文件路径
+        else if (std.mem.eql(u8, arg, "--pid-file")) {
+            const val_str = args.next() orelse {
+                std.debug.print("错误: --pid-file 选项缺少参数值\n", .{});
+                return error.MissingArgumentValue;
+            };
+            config.pid_file = try allocator.dupe(u8, val_str);
+        }
+        // 历史记录保留天数
+        else if (std.mem.eql(u8, arg, "--retention-days")) {
+            const val_str = args.next() orelse {
+                std.debug.print("错误: --retention-days 选项缺少参数值\n", .{});
+                return error.MissingArgumentValue;
+            };
+            config.retention_days = std.fmt.parseInt(u32, val_str, 10) catch {
+                std.debug.print("错误: --retention-days 参数值 '{s}' 不是有效数字!\n", .{val_str});
+                return error.InvalidArgumentValue;
+            };
+        }
+        // SQLite 存储开关
+        else if (std.mem.eql(u8, arg, "--sqlite")) {
+            config.use_sqlite = true;
+        }
+        else if (std.mem.eql(u8, arg, "--no-sqlite")) {
+            config.use_sqlite = false;
+        }
         // 帮助
         else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             printHelp();
             std.process.exit(0);
         }
+    }
+
+    // 验证互斥选项
+    if (config.daemon_mode and config.foreground) {
+        std.debug.print("错误: --daemon 和 --foreground/-f 不能同时使用\n", .{});
+        return error.ConflictingOptions;
     }
 
     return config;
@@ -87,17 +158,30 @@ fn printHelp() void {
         \\用法: traffic-backend [选项]
         \\
         \\选项:
-        \\  -d, --duration <秒>    采样间隔（默认: 1）
-        \\  -i, --interface <名>   指定监听网卡（例如: eth0, wlan0）
-        \\  -l, --list             列出系统所有网卡后退出
-        \\  -D, --day <天数>        显示最近 N 天流量统计（最多显示 3 天详情）
-        \\  -h, --help             显示帮助信息
+        \\  -d, --duration <秒>        采样间隔（默认: 1）
+        \\  -i, --interface <名>       指定监听网卡（例如: eth0, wlan0）
+        \\  -l, --list                 列出系统所有网卡后退出
+        \\  -D, --day <天数>           显示最近 N 天流量统计（最多显示 3 天详情）
+        \\  -h, --help                 显示帮助信息
+        \\
+        \\守护进程选项:
+        \\  --daemon                   以守护进程模式运行（后台）
+        \\  -f, --foreground           强制前台运行（与 --daemon 互斥）
+        \\  --pid-file <路径>          写入 PID 文件
+        \\  --log-file <路径>          输出日志到文件
+        \\
+        \\存储选项:
+        \\  --retention-days <天数>    历史记录保留天数（默认: 30）
+        \\  --sqlite                   使用 SQLite 存储
+        \\  --no-sqlite                禁用 SQLite 存储（默认）
         \\
         \\示例:
         \\  traffic-backend                自动选择默认网卡，每秒采样一次
         \\  traffic-backend -d 2 -i eth0   每 2 秒采样一次 eth0
         \\  traffic-backend -l             查看系统有哪些网卡
         \\  traffic-backend -D 3           显示最近 3 天的流量统计
+        \\  traffic-backend --daemon --pid-file /tmp/traffic.pid
+        \\                                 以守护进程模式运行
         \\
     , .{});
 }
@@ -107,13 +191,45 @@ pub fn main(init: std.process.Init) !void {
     // 安装 SIGINT / SIGTERM 处理器，使进程退出前有机会保存历史数据
     installSignalHandlers();
     const home_dir = init.environ_map.get("HOME");
-    try runDemo(init.io, init.gpa, init.minimal.args, home_dir);
+
+    // 先解析参数，以便判断是否需要 daemonize
+    var config = try parseArgs(init.gpa, init.minimal.args);
+    defer if (config.interface) |iface| init.gpa.free(iface);
+    defer if (config.log_file) |path| init.gpa.free(path);
+    defer if (config.pid_file) |path| init.gpa.free(path);
+
+    // ── Daemon 模式 ──────────────────────────────────────────────────────
+    var io = init.io;
+    if (config.daemon_mode and !config.foreground) {
+        const result = try daemon.daemonize();
+        switch (result) {
+            .parent => {
+                // 原始父进程退出，子进程（daemon）继续运行
+                return;
+            },
+            .daemon => {
+                // Grandchild (daemon): 重新安装信号处理器，获取新的 Io 实例
+                installSignalHandlers();
+                io = daemon.getIo();
+                // 重新解析 HOME（daemon 环境可能不同）
+                // 注意：config 已在父进程解析完毕，daemon 继承相同的配置
+            },
+        }
+    }
+
+    try runDemo(io, init.gpa, &config, home_dir);
 }
 
 /// 全局退出标志，由信号处理器置位
 var should_exit: std.atomic.Value(bool) = .init(false);
+/// 当前活跃的 PID 文件路径，信号处理器用此路径清理文件
+var active_pid_path: ?[]const u8 = null;
 
 fn signalHandler(_: std.posix.SIG) callconv(.c) void {
+    // 清理 PID 文件
+    if (active_pid_path) |path| {
+        pidfile.removePidFile(path);
+    }
     should_exit.store(true, .release);
 }
 
@@ -129,17 +245,14 @@ fn installSignalHandlers() void {
     posix.sigaction(.TERM, &act, null);
 }
 
-fn runDemo(io: std.Io, allocator: Allocator, args_vec: std.process.Args, home_dir: ?[]const u8) !void {
-    const config = try parseArgs(allocator, args_vec);
-    defer if (config.interface) |iface| allocator.free(iface);
-
+fn runDemo(io: std.Io, allocator: Allocator, config: *AppConfig, home_dir: ?[]const u8) !void {
     if (config.list_only) {
         try printInterfaceList(io, allocator);
         return;
     }
 
     if (config.day_count > 0) {
-        try printDayStats(io, allocator, config.day_count, home_dir);
+        try printDayStats(io, allocator, config.day_count, home_dir, config.use_sqlite);
         if (!config.interval_explicit) {
             return;
         }
@@ -150,26 +263,73 @@ fn runDemo(io: std.Io, allocator: Allocator, args_vec: std.process.Args, home_di
         return error.InvalidInterval;
     }
 
-    // 初始化历史存储（用于记录每日流量）
-    const state_path = storage.defaultStateFilePath(allocator, home_dir) catch |err| {
-        std.debug.print("警告: 无法确定状态文件路径 ({s})，历史记录功能已禁用\n", .{@errorName(err)});
-        return runLiveMonitor(io, allocator, config, null);
-    };
-    defer allocator.free(state_path);
-
-    var stor = storage.Storage.init(allocator, io, state_path);
-    stor.load() catch |err| {
-        std.debug.print("警告: 加载历史记录失败 ({s})，将创建新记录\n", .{@errorName(err)});
-    };
+    // 写入 PID 文件（防止重复启动）
+    const pid_result = pidfile.writePidFile(allocator, config.pid_file);
+    if (pid_result) |path| {
+        active_pid_path = path;
+    } else |err| {
+        switch (err) {
+            error.AlreadyRunning => {
+                std.debug.print("错误: traffic-manager 已经在运行\n", .{});
+                return err;
+            },
+            error.PermissionDenied => {
+                std.debug.print("错误: 另一个实例正在运行（权限不足）\n", .{});
+                return err;
+            },
+            else => {
+                std.debug.print("警告: 无法写入 PID 文件 ({s})，继续运行\n", .{@errorName(err)});
+                // Non-fatal: continue without PID file
+            },
+        }
+    }
     defer {
-        stor.save() catch {};
-        stor.deinit();
+        if (active_pid_path) |path| {
+            pidfile.removePidFile(path);
+            allocator.free(path);
+        }
     }
 
-    try runLiveMonitor(io, allocator, config, &stor);
+    if (config.use_sqlite) {
+        // SQLite 存储模式
+        const db_path = sqlite_storage.defaultDbPath(allocator, home_dir) catch |err| {
+            std.debug.print("警告: 无法确定数据库路径 ({s})，回退到二进制存储\n", .{@errorName(err)});
+            return runLiveMonitorFile(io, allocator, config.*, null);
+        };
+        defer allocator.free(db_path);
+
+        var sqlite_stor = sqlite_storage.SQLiteStorage.open(allocator, io, db_path, home_dir, config.retention_days) catch |err| {
+            std.debug.print("警告: 无法打开 SQLite 数据库 ({s})，回退到二进制存储\n", .{@errorName(err)});
+            return runLiveMonitorFile(io, allocator, config.*, null);
+        };
+        defer {
+            sqlite_stor.save() catch {};
+            sqlite_stor.deinit();
+        }
+
+        try runLiveMonitorSqlite(io, allocator, config.*, &sqlite_stor);
+    } else {
+        // 二进制文件存储模式
+        const state_path = storage.defaultStateFilePath(allocator, home_dir) catch |err| {
+            std.debug.print("警告: 无法确定状态文件路径 ({s})，历史记录功能已禁用\n", .{@errorName(err)});
+            return runLiveMonitorFile(io, allocator, config.*, null);
+        };
+        defer allocator.free(state_path);
+
+        var stor = storage.Storage.init(allocator, io, state_path);
+        stor.load() catch |err| {
+            std.debug.print("警告: 加载历史记录失败 ({s})，将创建新记录\n", .{@errorName(err)});
+        };
+        defer {
+            stor.save() catch {};
+            stor.deinit();
+        }
+
+        try runLiveMonitorFile(io, allocator, config.*, &stor);
+    }
 }
 
-fn runLiveMonitor(io: std.Io, allocator: Allocator, config: AppConfig, stor: ?*storage.Storage) !void {
+fn runLiveMonitorFile(io: std.Io, allocator: Allocator, config: AppConfig, stor: ?*storage.Storage) !void {
     // 解析监听网卡
     const iface = if (config.interface) |name|
         try allocator.dupe(u8, name)
@@ -242,6 +402,71 @@ fn runLiveMonitor(io: std.Io, allocator: Allocator, config: AppConfig, stor: ?*s
     }
 }
 
+fn runLiveMonitorSqlite(io: std.Io, allocator: Allocator, config: AppConfig, stor: *sqlite_storage.SQLiteStorage) !void {
+    // 解析监听网卡
+    const iface = if (config.interface) |name|
+        try allocator.dupe(u8, name)
+    else
+        traffic.findDefaultInterface(allocator, io) catch |err| {
+            std.debug.print("错误: 未找到可用网卡 ({s})，请用 -i <name> 手动指定\n", .{@errorName(err)});
+            return err;
+        };
+    defer allocator.free(iface);
+
+    var tracker = traffic.TrafficTracker.init(null);
+
+    try printOut(io, "\n============ Traffic Manager (SQLite) ============\n", .{});
+    try printOut(io, "  网卡: {s}    采样间隔: {d} 秒    保留: {d} 天    按 Ctrl+C 退出\n", .{
+        iface,
+        config.interval_sec,
+        config.retention_days,
+    });
+    try printOut(io, "--------------------------------------------------------------\n", .{});
+    try printOut(io, "  时间          ↓ 下行速率      ↑ 上行速率      ↓ PPS    ↑ PPS    累计下行        累计上行\n", .{});
+    try printOut(io, "--------------------------------------------------------------\n", .{});
+
+    var time_buf: [16]u8 = undefined;
+    var rx_speed_buf: [24]u8 = undefined;
+    var tx_speed_buf: [24]u8 = undefined;
+    var rx_total_buf: [24]u8 = undefined;
+    var tx_total_buf: [24]u8 = undefined;
+
+    while (!should_exit.load(.acquire)) {
+        const stats = tracker.update(iface, allocator, io) catch |err| {
+            std.debug.print("采样失败: {s}\n", .{@errorName(err)});
+            return err;
+        };
+
+        try printOut(io, "{s}   {s:>13}   {s:>13}   {d:>7}   {d:>7}   {s:>14}   {s:>14}\n", .{
+            formatTimestamp(&time_buf, stats.timestamp_ms),
+            formatBytes(&rx_speed_buf, stats.rx_speed_bps, "/s"),
+            formatBytes(&tx_speed_buf, stats.tx_speed_bps, "/s"),
+            stats.rx_pps,
+            stats.tx_pps,
+            formatBytes(&rx_total_buf, stats.total_rx_bytes, ""),
+            formatBytes(&tx_total_buf, stats.total_tx_bytes, ""),
+        });
+
+        // 更新今日流量（缓冲写入，每 5 分钟自动刷盘）
+        const epoch_secs: u64 = @intCast(@divTrunc(stats.timestamp_ms, 1000));
+        stor.update(stats, epoch_secs) catch |err| {
+            std.debug.print("SQLite 写入失败: {s}\n", .{@errorName(err)});
+        };
+
+        // 使用 clock_nanosleep（保证被信号中断，不会自动重启）
+        const sleep_ns: u64 = config.interval_sec * std.time.ns_per_s;
+        var req = std.os.linux.timespec{ .sec = @intCast(@divTrunc(sleep_ns, std.time.ns_per_s)), .nsec = @intCast(@mod(sleep_ns, std.time.ns_per_s)) };
+        var rem: std.os.linux.timespec = undefined;
+        _ = std.os.linux.clock_nanosleep(.MONOTONIC, .{ .ABSTIME = false }, &req, &rem);
+        // clock_nanosleep 返回 EINTR 时，循环顶部的 should_exit 检查会捕获退出信号
+    }
+
+    // 收到信号，保存剩余缓冲数据
+    stor.save() catch |err| {
+        std.debug.print("SQLite 保存失败: {s}\n", .{@errorName(err)});
+    };
+}
+
 fn printInterfaceList(io: std.Io, allocator: Allocator) !void {
     const ifaces = traffic.listInterfaces(allocator, io) catch |err| {
         std.debug.print("错误: 无法读取网卡列表: {s}\n", .{@errorName(err)});
@@ -259,68 +484,138 @@ fn printInterfaceList(io: std.Io, allocator: Allocator) !void {
     try printOut(io, "提示: 使用 -i <name> 指定要监听的网卡\n", .{});
 }
 
-fn printDayStats(io: std.Io, allocator: Allocator, day_count: u32, home_dir: ?[]const u8) !void {
-    const state_path = storage.defaultStateFilePath(allocator, home_dir) catch {
-        std.debug.print("错误: 无法确定状态文件路径\n", .{});
-        return;
-    };
-    defer allocator.free(state_path);
+fn printDayStats(io: std.Io, allocator: Allocator, day_count: u32, home_dir: ?[]const u8, use_sqlite: bool) !void {
+    if (use_sqlite) {
+        // SQLite 模式
+        const db_path = sqlite_storage.defaultDbPath(allocator, home_dir) catch {
+            std.debug.print("错误: 无法确定数据库路径\n", .{});
+            return;
+        };
+        defer allocator.free(db_path);
 
-    var stor = storage.Storage.init(allocator, io, state_path);
-    stor.load() catch |err| {
-        std.debug.print("错误: 加载历史记录失败: {s}\n", .{@errorName(err)});
-        return;
-    };
-    defer stor.deinit();
+        var sqlite_stor = sqlite_storage.SQLiteStorage.open(allocator, io, db_path, home_dir, 0) catch |err| {
+            std.debug.print("错误: 无法打开 SQLite 数据库: {s}\n", .{@errorName(err)});
+            return;
+        };
+        defer sqlite_stor.deinit();
 
-    const days = stor.getLastDays(@intCast(day_count));
-    if (days.len == 0) {
-        try printOut(io, "\n暂无历史流量记录。请先运行一段时间后再查询。\n", .{});
-        return;
-    }
+        const days = sqlite_stor.getLastDays(day_count) catch |err| {
+            std.debug.print("错误: 查询历史记录失败: {s}\n", .{@errorName(err)});
+            return;
+        };
+        defer allocator.free(days);
 
-    const show_detail = @min(days.len, 3);
+        if (days.len == 0) {
+            try printOut(io, "\n暂无历史流量记录。请先运行一段时间后再查询。\n", .{});
+            return;
+        }
 
-    try printOut(io, "\n============ 最近 {d} 天流量统计 ============\n", .{day_count});
-    try printOut(io, "  日期            累计下行       累计上行       下行包数      上行包数\n", .{});
-    try printOut(io, "--------------------------------------------------------------\n", .{});
+        const show_detail = @min(days.len, 3);
 
-    var rx_buf: [24]u8 = undefined;
-    var tx_buf: [24]u8 = undefined;
+        try printOut(io, "\n============ 最近 {d} 天流量统计 (SQLite) ============\n", .{day_count});
+        try printOut(io, "  日期            累计下行       累计上行       下行包数      上行包数\n", .{});
+        try printOut(io, "--------------------------------------------------------------\n", .{});
 
-    for (days, 0..) |record, i| {
-        if (i < show_detail) {
-            try printOut(io, "  {s}     {s:>14}   {s:>14}   {d:>11}   {d:>11}\n", .{
-                formatDate(record.date),
-                formatBytes(&rx_buf, record.total_rx_bytes, ""),
-                formatBytes(&tx_buf, record.total_tx_bytes, ""),
-                record.total_rx_packets,
-                record.total_tx_packets,
+        var rx_buf: [24]u8 = undefined;
+        var tx_buf: [24]u8 = undefined;
+
+        for (days, 0..) |record, i| {
+            if (i < show_detail) {
+                try printOut(io, "  {s}     {s:>14}   {s:>14}   {d:>11}   {d:>11}\n", .{
+                    formatDate(record.date),
+                    formatBytes(&rx_buf, record.total_rx_bytes, ""),
+                    formatBytes(&tx_buf, record.total_tx_bytes, ""),
+                    record.total_rx_packets,
+                    record.total_tx_packets,
+                });
+            }
+        }
+
+        // 汇总行
+        if (days.len > 1) {
+            var sum_rx: u64 = 0;
+            var sum_tx: u64 = 0;
+            for (days) |r| {
+                sum_rx += r.total_rx_bytes;
+                sum_tx += r.total_tx_bytes;
+            }
+            try printOut(io, "--------------------------------------------------------------\n", .{});
+            try printOut(io, "  合计（{d} 天）    {s:>14}   {s:>14}\n", .{
+                days.len,
+                formatBytes(&rx_buf, sum_rx, ""),
+                formatBytes(&tx_buf, sum_tx, ""),
             });
         }
-    }
 
-    // 汇总行
-    if (days.len > 1) {
-        var sum_rx: u64 = 0;
-        var sum_tx: u64 = 0;
-        for (days) |r| {
-            sum_rx += r.total_rx_bytes;
-            sum_tx += r.total_tx_bytes;
-        }
         try printOut(io, "--------------------------------------------------------------\n", .{});
-        try printOut(io, "  合计（{d} 天）    {s:>14}   {s:>14}\n", .{
-            days.len,
-            formatBytes(&rx_buf, sum_rx, ""),
-            formatBytes(&tx_buf, sum_tx, ""),
-        });
-    }
+        if (days.len < day_count) {
+            try printOut(io, "  注: 仅找到 {d} 天记录（请求 {d} 天）\n", .{ days.len, day_count });
+        }
+        try printOut(io, "  提示: 先运行 traffic-backend 一段时间积累数据，再用 -D N 查看统计\n\n", .{});
+    } else {
+        // 二进制文件模式
+        const state_path = storage.defaultStateFilePath(allocator, home_dir) catch {
+            std.debug.print("错误: 无法确定状态文件路径\n", .{});
+            return;
+        };
+        defer allocator.free(state_path);
 
-    try printOut(io, "--------------------------------------------------------------\n", .{});
-    if (days.len < day_count) {
-        try printOut(io, "  注: 仅找到 {d} 天记录（请求 {d} 天）\n", .{ days.len, day_count });
+        var stor = storage.Storage.init(allocator, io, state_path);
+        stor.load() catch |err| {
+            std.debug.print("错误: 加载历史记录失败: {s}\n", .{@errorName(err)});
+            return;
+        };
+        defer stor.deinit();
+
+        const days = stor.getLastDays(@intCast(day_count));
+        if (days.len == 0) {
+            try printOut(io, "\n暂无历史流量记录。请先运行一段时间后再查询。\n", .{});
+            return;
+        }
+
+        const show_detail = @min(days.len, 3);
+
+        try printOut(io, "\n============ 最近 {d} 天流量统计 ============\n", .{day_count});
+        try printOut(io, "  日期            累计下行       累计上行       下行包数      上行包数\n", .{});
+        try printOut(io, "--------------------------------------------------------------\n", .{});
+
+        var rx_buf: [24]u8 = undefined;
+        var tx_buf: [24]u8 = undefined;
+
+        for (days, 0..) |record, i| {
+            if (i < show_detail) {
+                try printOut(io, "  {s}     {s:>14}   {s:>14}   {d:>11}   {d:>11}\n", .{
+                    formatDate(record.date),
+                    formatBytes(&rx_buf, record.total_rx_bytes, ""),
+                    formatBytes(&tx_buf, record.total_tx_bytes, ""),
+                    record.total_rx_packets,
+                    record.total_tx_packets,
+                });
+            }
+        }
+
+        // 汇总行
+        if (days.len > 1) {
+            var sum_rx: u64 = 0;
+            var sum_tx: u64 = 0;
+            for (days) |r| {
+                sum_rx += r.total_rx_bytes;
+                sum_tx += r.total_tx_bytes;
+            }
+            try printOut(io, "--------------------------------------------------------------\n", .{});
+            try printOut(io, "  合计（{d} 天）    {s:>14}   {s:>14}\n", .{
+                days.len,
+                formatBytes(&rx_buf, sum_rx, ""),
+                formatBytes(&tx_buf, sum_tx, ""),
+            });
+        }
+
+        try printOut(io, "--------------------------------------------------------------\n", .{});
+        if (days.len < day_count) {
+            try printOut(io, "  注: 仅找到 {d} 天记录（请求 {d} 天）\n", .{ days.len, day_count });
+        }
+        try printOut(io, "  提示: 先运行 traffic-backend 一段时间积累数据，再用 -D N 查看统计\n\n", .{});
     }
-    try printOut(io, "  提示: 先运行 traffic-backend 一段时间积累数据，再用 -D N 查看统计\n\n", .{});
 }
 
 /// 向标准输出打印一行（可被管道/重定向捕获）
@@ -376,4 +671,8 @@ var format_date_buf: [16]u8 = undefined;
 test {
     std.testing.refAllDecls(traffic);
     std.testing.refAllDecls(storage);
+    std.testing.refAllDecls(sqlite_storage);
+    std.testing.refAllDecls(pidfile);
+    std.testing.refAllDecls(daemon);
+    std.testing.refAllDecls(log);
 }

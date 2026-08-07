@@ -5,6 +5,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // 添加 zqlite 依赖
+    const zqlite_dep = b.dependency("zqlite", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     // 创建后端可执行文件配置
     const exe = b.addExecutable(.{
         .name = "traffic-backend",
@@ -14,6 +20,10 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    exe.root_module.link_libc = true;
+
+    // 添加 zqlite 模块依赖（对所有源文件可见）
+    exe.root_module.addImport("zqlite", zqlite_dep.module("zqlite"));
 
     // 将产物安装到 zig-out/bin/
     b.installArtifact(exe);
@@ -39,6 +49,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    exe_unit_tests.root_module.link_libc = true;
+    exe_unit_tests.root_module.addImport("zqlite", zqlite_dep.module("zqlite"));
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 
