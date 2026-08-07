@@ -3,3 +3,14 @@
 **/zig-out/
 
 .omo/
+
+.jj*.json
+
+AGENTS.md
+
+backend/root
+
+**/zig-pkg/
+
+# 静态库编译产物（构建生成，非源码）
+**/*.a

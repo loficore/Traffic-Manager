@@ -1,0 +1,209 @@
+#!/bin/sh
+#
+# traffic-manager.init — BusyBox-compatible init script for traffic-manager
+#
+# For embedded Linux systems using BusyBox init (no systemd).
+# Supports: start, stop, restart, status
+#
+# Installation:
+#   1. Copy this file to /etc/init.d/traffic-manager
+#   2. chmod +x /etc/init.d/traffic-manager
+#   3. Add to /etc/inittab (see bottom of file)
+#
+# Configuration — override via environment before calling this script,
+# or edit these defaults directly.
+#
+
+DAEMON="${DAEMON:-/usr/bin/traffic-backend}"
+PIDFILE="${PIDFILE:-/var/run/traffic-manager.pid}"
+LOGFILE="${LOGFILE:-/var/log/traffic-manager.log}"
+
+# Extra arguments passed to traffic-backend.
+# Example: EXTRA_ARGS="--sqlite --retention-days 60 -d 2 -i eth0"
+EXTRA_ARGS="${EXTRA_ARGS:-}"
+
+# How long to wait after stop before checking if the process died
+STOP_TIMEOUT=5
+
+# ── Helpers ──────────────────────────────────────────────────────────────
+
+log_msg() {
+    echo "traffic-manager: $1"
+}
+
+is_running() {
+    if [ -f "$PIDFILE" ]; then
+        pid=$(cat "$PIDFILE" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# ── Commands ─────────────────────────────────────────────────────────────
+
+do_start() {
+    if is_running; then
+        log_msg "already running (PID $(cat "$PIDFILE"))"
+        return 1
+    fi
+
+    # Clean up stale PID file if process is gone
+    rm -f "$PIDFILE"
+
+    log_msg "starting..."
+
+    if [ -n "$LOGFILE" ]; then
+        $DAEMON --daemon --pid-file "$PIDFILE" --log-file "$LOGFILE" $EXTRA_ARGS
+    else
+        $DAEMON --daemon --pid-file "$PIDFILE" $EXTRA_ARGS
+    fi
+
+    # Give the daemon a moment to write its PID file
+    sleep 1
+
+    if is_running; then
+        log_msg "started (PID $(cat "$PIDFILE"))"
+        return 0
+    else
+        log_msg "failed to start"
+        return 1
+    fi
+}
+
+do_stop() {
+    if ! is_running; then
+        log_msg "not running"
+        return 0
+    fi
+
+    pid=$(cat "$PIDFILE")
+    log_msg "stopping (PID $pid)..."
+
+    # Send SIGTERM for graceful shutdown (traffic-manager saves state on SIGTERM)
+    kill -TERM "$pid" 2>/dev/null
+
+    # Wait for the process to exit
+    i=0
+    while [ "$i" -lt "$STOP_TIMEOUT" ]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            log_msg "stopped"
+            rm -f "$PIDFILE"
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+
+    # Process didn't exit in time, force kill
+    log_msg "sending SIGKILL..."
+    kill -KILL "$pid" 2>/dev/null
+    sleep 1
+    rm -f "$PIDFILE"
+    log_msg "killed"
+    return 0
+}
+
+do_restart() {
+    do_stop
+    # Brief pause so the port/file lock can be released
+    sleep 1
+    do_start
+}
+
+do_status() {
+    if is_running; then
+        pid=$(cat "$PIDFILE")
+        log_msg "running (PID $pid)"
+
+        # Show uptime if /proc is available
+        if [ -f "/proc/$pid/stat" ]; then
+            start_ticks=$(awk '{print $22}' /proc/$pid/stat 2>/dev/null)
+            if [ -n "$start_ticks" ]; then
+                hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+                uptime_secs=$(cat /proc/uptime | awk '{print int($1)}')
+                # Approximate: just show raw elapsed seconds from /proc/uptime
+                log_msg "system uptime: ${uptime_secs}s"
+            fi
+        fi
+        return 0
+    else
+        log_msg "not running"
+        return 3
+    fi
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────
+
+case "$1" in
+    start)
+        do_start
+        ;;
+    stop)
+        do_stop
+        ;;
+    restart)
+        do_restart
+        ;;
+    status)
+        do_status
+        ;;
+    fg)
+        # Foreground mode for use with inittab respawn
+        exec $DAEMON -f $EXTRA_ARGS
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status|fg}"
+        exit 1
+        ;;
+esac
+
+exit $?
+
+# ──────────────────────────────────────────────────────────────────────────
+# /etc/inittab examples for BusyBox init:
+#
+# BusyBox inittab format: id:runlevel:action:process
+#
+# Option A: Start once at boot (recommended for most setups)
+#   tm0:345:once:/etc/init.d/traffic-manager start
+#
+# Option B: Respawn if it dies (use fg mode, since respawn manages the process)
+#   tm0:345:respawn:/etc/init.d/traffic-manager fg
+#
+# Option C: Start on system init, stop on shutdown
+#   tm0:sysinit:/etc/init.d/traffic-manager start
+#   tm1:shutdown:/etc/init.d/traffic-manager stop
+#
+# ──────────────────────────────────────────────────────────────────────────
+# Manual installation steps:
+#
+#   1. Build the binary:
+#        cd backend && zig build -Doptimize=ReleaseFast
+#
+#   2. Copy binary to the target:
+#        cp zig-out/bin/traffic-backend /usr/bin/traffic-backend
+#
+#   3. Copy this script:
+#        cp backend/scripts/traffic-manager.init /etc/init.d/traffic-manager
+#        chmod +x /etc/init.d/traffic-manager
+#
+#   4. Create log directory (optional):
+#        mkdir -p /var/log
+#
+#   5. Add to /etc/inittab (see above) and reboot, or start manually:
+#        /etc/init.d/traffic-manager start
+#
+#   6. Verify:
+#        /etc/init.d/traffic-manager status
+#
+#   To customize, set EXTRA_ARGS before calling the script:
+#        EXTRA_ARGS="--sqlite -d 5 -i wlan0" /etc/init.d/traffic-manager start
+#
+#   Or edit the defaults at the top of this file.
+#
+#   The "fg" command runs the daemon in foreground, useful for:
+#   - Debugging: /etc/init.d/traffic-manager fg
+#   - inittab respawn (see above): tm0:345:respawn:/etc/init.d/traffic-manager fg
+# ──────────────────────────────────────────────────────────────────────────
