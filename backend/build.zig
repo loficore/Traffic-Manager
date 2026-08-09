@@ -25,6 +25,13 @@ pub fn build(b: *std.Build) void {
     // 添加 zqlite 模块依赖（对所有源文件可见）
     exe.root_module.addImport("zqlite", zqlite_dep.module("zqlite"));
 
+    // 添加 SMTP C 库的 include 路径和源文件
+    exe.root_module.addIncludePath(b.path("vendor/smtp"));
+    exe.root_module.addCSourceFile(.{
+        .file = b.path("vendor/smtp/smtp.c"),
+        .flags = &.{},
+    });
+
     // 将产物安装到 zig-out/bin/
     b.installArtifact(exe);
 
@@ -41,7 +48,7 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "运行后端服务");
     run_step.dependOn(&run_cmd.step);
 
-    // 添加 `zig build test` 单元测试步骤
+    // ── Original inline tests (refAllDecls in main.zig) ──
     const exe_unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
@@ -51,9 +58,104 @@ pub fn build(b: *std.Build) void {
     });
     exe_unit_tests.root_module.link_libc = true;
     exe_unit_tests.root_module.addImport("zqlite", zqlite_dep.module("zqlite"));
+    exe_unit_tests.root_module.addIncludePath(b.path("vendor/smtp"));
+    exe_unit_tests.root_module.addCSourceFile(.{
+        .file = b.path("vendor/smtp/smtp.c"),
+        .flags = &.{},
+    });
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 
     const test_step = b.step("test", "运行单元测试");
     test_step.dependOn(&run_exe_unit_tests.step);
+
+    // ── Independent test files (tests/) ──
+    // Each test file imports its source module by name (e.g. @import("quota")).
+    // The build system wires the source module as a named dependency.
+
+    // Source module: quota (depends on zqlite)
+    const quota_src = b.createModule(.{
+        .root_source_file = b.path("src/quota.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    quota_src.addImport("zqlite", zqlite_dep.module("zqlite"));
+
+    // Source module: config
+    const config_src = b.createModule(.{
+        .root_source_file = b.path("src/config.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Source module: log
+    const log_src = b.createModule(.{
+        .root_source_file = b.path("src/log.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Source module: network (needs libc for @cImport)
+    const network_src = b.createModule(.{
+        .root_source_file = b.path("src/network.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    network_src.link_libc = true;
+
+    // Source module: notify_template
+    const notify_src = b.createModule(.{
+        .root_source_file = b.path("src/notify_template.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Source module: smtp (needs libc for @cImport)
+    const smtp_src = b.createModule(.{
+        .root_source_file = b.path("src/smtp.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    smtp_src.link_libc = true;
+    smtp_src.addIncludePath(b.path("vendor/smtp"));
+    smtp_src.addCSourceFile(.{
+        .file = b.path("vendor/smtp/smtp.c"),
+        .flags = &.{},
+    });
+
+    // Source module: webhook
+    const webhook_src = b.createModule(.{
+        .root_source_file = b.path("src/webhook.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Test file definitions: (test_file, source_module_name, source_module)
+    const test_defs = [_]struct {
+        file: []const u8,
+        src_name: []const u8,
+        src_mod: *std.Build.Module,
+    }{
+        .{ .file = "tests/test_quota.zig", .src_name = "quota", .src_mod = quota_src },
+        .{ .file = "tests/test_config.zig", .src_name = "cfg", .src_mod = config_src },
+        .{ .file = "tests/test_log.zig", .src_name = "log_mod", .src_mod = log_src },
+        .{ .file = "tests/test_network.zig", .src_name = "network", .src_mod = network_src },
+        .{ .file = "tests/test_notify.zig", .src_name = "notify", .src_mod = notify_src },
+        .{ .file = "tests/test_smtp.zig", .src_name = "smtp", .src_mod = smtp_src },
+        .{ .file = "tests/test_webhook.zig", .src_name = "webhook", .src_mod = webhook_src },
+    };
+
+    for (test_defs) |td| {
+        const test_mod = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(td.file),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        test_mod.root_module.addImport(td.src_name, td.src_mod);
+
+        const run_test_mod = b.addRunArtifact(test_mod);
+        test_step.dependOn(&run_test_mod.step);
+    }
 }

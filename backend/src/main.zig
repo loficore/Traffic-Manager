@@ -13,6 +13,12 @@ pub const pidfile = @import("pidfile.zig");
 pub const daemon = @import("daemon.zig");
 pub const log = @import("log.zig");
 pub const sqlite_schema = @import("sqlite_schema.zig");
+pub const network = @import("network.zig");
+pub const webhook = @import("webhook.zig");
+pub const smtp = @import("smtp.zig");
+pub const cfg = @import("config.zig");
+pub const notify_template = @import("notify_template.zig");
+pub const quota = @import("quota.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -45,29 +51,95 @@ pub const AppConfig = struct {
     retention_days: u32 = 30,
     /// 使用 SQLite 存储
     use_sqlite: bool = false,
+    // ── Quota 配置 ──
+    /// 月度流量配额限制（字节），0 = 禁用配额检查
+    quota_limit_bytes: u64 = 0,
+    /// 警告阈值（占配额比例，如 0.9 = 90%）
+    quota_warning_threshold: f64 = 0.9,
+    /// 断网阈值（占配额比例，如 1.0 = 100%）
+    quota_disconnect_threshold: f64 = 1.0,
+    /// 每月配额重置日期（1-28）
+    quota_reset_day: u8 = 1,
+    // ── 通知配置 ──
+    /// Webhook URL（用于 HTTP POST 通知）
+    webhook_url: ?[]const u8 = null,
+    /// SMTP 服务器地址
+    smtp_server: ?[]const u8 = null,
+    /// SMTP 端口
+    smtp_port: ?[]const u8 = null,
+    /// SMTP 认证用户名
+    smtp_user: ?[]const u8 = null,
+    /// SMTP 认证密码
+    smtp_pass: ?[]const u8 = null,
+    /// SMTP 发件人地址
+    smtp_from: ?[]const u8 = null,
+    /// SMTP 收件人地址
+    smtp_to: ?[]const u8 = null,
+    // ── 运行时控制 ──
+    /// 手动恢复网络并重置配额状态
+    restore_network: bool = false,
+    /// 配额重置日（1-28），用于自动恢复判断
+    reset_day: u8 = 1,
 };
 
-pub fn parseArgs(allocator: Allocator, args_vec: std.process.Args) !AppConfig {
-    var config = AppConfig{};
-
+pub fn parseArgs(io: std.Io, allocator: Allocator, args_vec: std.process.Args) !AppConfig {
     var args = try std.process.Args.Iterator.initAllocator(args_vec, allocator);
     defer args.deinit();
 
     // 跳过第 0 个参数（程序自身路径）
     _ = args.skip();
 
+    // First pass: find --config flag
+    var config_path_arg: ?[]const u8 = null;
     while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--config")) {
+            config_path_arg = args.next() orelse {
+                std.debug.print("错误: --config 选项缺少参数值\n", .{});
+                return error.MissingArgumentValue;
+            };
+            break;
+        }
+    }
+
+    // Reset iterator for second pass
+    args.deinit();
+    args = try std.process.Args.Iterator.initAllocator(args_vec, allocator);
+    defer args.deinit();
+    _ = args.skip();
+
+    // Parse config file if specified
+    var file_config = cfg.Config{};
+    var file_source = cfg.ConfigSource{};
+    if (config_path_arg) |path| {
+        const parsed = cfg.parseConfigFile(io, allocator, path) catch |err| {
+            std.debug.print("错误: 无法解析配置文件 '{s}': {s}\n", .{ path, @errorName(err) });
+            return err;
+        };
+        file_config = parsed.config;
+        file_source = parsed.source;
+    }
+
+    // Second pass: parse CLI arguments
+    var cli_config = AppConfig{};
+    var cli_source = cfg.ConfigSource{};
+
+    while (args.next()) |arg| {
+        // 配置文件路径（已在第一轮处理，这里跳过值）
+        if (std.mem.eql(u8, arg, "--config")) {
+            _ = args.next(); // skip value
+        }
         // 采样间隔（秒）
-        if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--duration")) {
+        else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--duration")) {
             const val_str = args.next() orelse {
                 std.debug.print("错误: -d/--duration 选项缺少参数值\n", .{});
                 return error.MissingArgumentValue;
             };
-            config.interval_sec = std.fmt.parseInt(u64, val_str, 10) catch {
+            cli_config.interval_sec = std.fmt.parseInt(u64, val_str, 10) catch {
                 std.debug.print("错误: -d/--duration 参数值 '{s}' 不是有效数字!\n", .{val_str});
                 return error.InvalidArgumentValue;
             };
-            config.interval_explicit = true;
+            cli_config.interval_explicit = true;
+            cli_source.interval_sec = true;
         }
         // 指定监听网卡
         else if (std.mem.eql(u8, arg, "-i") or std.mem.eql(u8, arg, "--interface")) {
@@ -76,11 +148,13 @@ pub fn parseArgs(allocator: Allocator, args_vec: std.process.Args) !AppConfig {
                 return error.MissingArgumentValue;
             };
             // args.deinit() 会释放 val_str，因此复制一份
-            config.interface = try allocator.dupe(u8, val_str);
+            cli_config.interface = try allocator.dupe(u8, val_str);
+            cli_source.interface = true;
         }
         // 列出网卡
         else if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--list")) {
-            config.list_only = true;
+            cli_config.list_only = true;
+            cli_source.list_only = true;
         }
         // 查询历史流量
         else if (std.mem.eql(u8, arg, "-D") or std.mem.eql(u8, arg, "--day")) {
@@ -88,18 +162,21 @@ pub fn parseArgs(allocator: Allocator, args_vec: std.process.Args) !AppConfig {
                 std.debug.print("错误: -D/--day 选项缺少参数值\n", .{});
                 return error.MissingArgumentValue;
             };
-            config.day_count = std.fmt.parseInt(u32, val_str, 10) catch {
+            cli_config.day_count = std.fmt.parseInt(u32, val_str, 10) catch {
                 std.debug.print("错误: -D/--day 参数值 '{s}' 不是有效数字!\n", .{val_str});
                 return error.InvalidArgumentValue;
             };
+            cli_source.day_count = true;
         }
         // 守护进程模式（无短标志，避免与 -D 冲突）
         else if (std.mem.eql(u8, arg, "--daemon")) {
-            config.daemon_mode = true;
+            cli_config.daemon_mode = true;
+            cli_source.daemon_mode = true;
         }
         // 强制前台运行
         else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--foreground")) {
-            config.foreground = true;
+            cli_config.foreground = true;
+            cli_source.foreground = true;
         }
         // 日志文件路径
         else if (std.mem.eql(u8, arg, "--log-file")) {
@@ -107,7 +184,8 @@ pub fn parseArgs(allocator: Allocator, args_vec: std.process.Args) !AppConfig {
                 std.debug.print("错误: --log-file 选项缺少参数值\n", .{});
                 return error.MissingArgumentValue;
             };
-            config.log_file = try allocator.dupe(u8, val_str);
+            cli_config.log_file = try allocator.dupe(u8, val_str);
+            cli_source.log_file = true;
         }
         // PID 文件路径
         else if (std.mem.eql(u8, arg, "--pid-file")) {
@@ -115,7 +193,8 @@ pub fn parseArgs(allocator: Allocator, args_vec: std.process.Args) !AppConfig {
                 std.debug.print("错误: --pid-file 选项缺少参数值\n", .{});
                 return error.MissingArgumentValue;
             };
-            config.pid_file = try allocator.dupe(u8, val_str);
+            cli_config.pid_file = try allocator.dupe(u8, val_str);
+            cli_source.pid_file = true;
         }
         // 历史记录保留天数
         else if (std.mem.eql(u8, arg, "--retention-days")) {
@@ -123,17 +202,148 @@ pub fn parseArgs(allocator: Allocator, args_vec: std.process.Args) !AppConfig {
                 std.debug.print("错误: --retention-days 选项缺少参数值\n", .{});
                 return error.MissingArgumentValue;
             };
-            config.retention_days = std.fmt.parseInt(u32, val_str, 10) catch {
+            cli_config.retention_days = std.fmt.parseInt(u32, val_str, 10) catch {
                 std.debug.print("错误: --retention-days 参数值 '{s}' 不是有效数字!\n", .{val_str});
                 return error.InvalidArgumentValue;
             };
+            cli_source.retention_days = true;
         }
         // SQLite 存储开关
         else if (std.mem.eql(u8, arg, "--sqlite")) {
-            config.use_sqlite = true;
+            cli_config.use_sqlite = true;
+            cli_source.use_sqlite = true;
         }
         else if (std.mem.eql(u8, arg, "--no-sqlite")) {
-            config.use_sqlite = false;
+            cli_config.use_sqlite = false;
+            cli_source.use_sqlite = true;
+        }
+        // ── Quota 配置 ──
+        // 月度流量配额限制（支持人类可读格式：100GB, 500MB, 1TB）
+        else if (std.mem.eql(u8, arg, "--quota-limit")) {
+            const val_str = args.next() orelse {
+                std.debug.print("错误: --quota-limit 选项缺少参数值\n", .{});
+                return error.MissingArgumentValue;
+            };
+            cli_config.quota_limit_bytes = quota.parseTrafficUnit(val_str) catch {
+                std.debug.print("错误: --quota-limit 参数值 '{s}' 无效（支持: 100GB, 500MB, 1TB）\n", .{val_str});
+                return error.InvalidArgumentValue;
+            };
+            cli_source.quota_limit_bytes = true;
+        }
+        // 警告阈值（0.0-1.0）
+        else if (std.mem.eql(u8, arg, "--quota-warning")) {
+            const val_str = args.next() orelse {
+                std.debug.print("错误: --quota-warning 选项缺少参数值\n", .{});
+                return error.MissingArgumentValue;
+            };
+            const parsed = std.fmt.parseFloat(f64, val_str) catch {
+                std.debug.print("警告: --quota-warning 参数值 '{s}' 不是有效数字，使用默认值 0.9\n", .{val_str});
+                continue;
+            };
+            if (parsed < 0.0 or parsed > 1.0) {
+                std.debug.print("警告: --quota-warning 参数值 '{s}' 不在有效范围内（0.0-1.0），使用默认值 0.9\n", .{val_str});
+                continue;
+            }
+            cli_config.quota_warning_threshold = parsed;
+            cli_source.quota_warning_threshold = true;
+        }
+        // 断网阈值（0.0-1.0）
+        else if (std.mem.eql(u8, arg, "--quota-disconnect")) {
+            const val_str = args.next() orelse {
+                std.debug.print("错误: --quota-disconnect 选项缺少参数值\n", .{});
+                return error.MissingArgumentValue;
+            };
+            const parsed = std.fmt.parseFloat(f64, val_str) catch {
+                std.debug.print("警告: --quota-disconnect 参数值 '{s}' 不是有效数字，使用默认值 1.0\n", .{val_str});
+                continue;
+            };
+            if (parsed < 0.0 or parsed > 1.0) {
+                std.debug.print("警告: --quota-disconnect 参数值 '{s}' 不在有效范围内（0.0-1.0），使用默认值 1.0\n", .{val_str});
+                continue;
+            }
+            cli_config.quota_disconnect_threshold = parsed;
+            cli_source.quota_disconnect_threshold = true;
+        }
+        // ── 通知配置 ──
+        // Webhook URL
+        else if (std.mem.eql(u8, arg, "--webhook-url")) {
+            const val_str = args.next() orelse {
+                std.debug.print("错误: --webhook-url 选项缺少参数值\n", .{});
+                return error.MissingArgumentValue;
+            };
+            cli_config.webhook_url = try allocator.dupe(u8, val_str);
+            cli_source.webhook_url = true;
+        }
+        // SMTP 服务器
+        else if (std.mem.eql(u8, arg, "--smtp-server")) {
+            const val_str = args.next() orelse {
+                std.debug.print("错误: --smtp-server 选项缺少参数值\n", .{});
+                return error.MissingArgumentValue;
+            };
+            cli_config.smtp_server = try allocator.dupe(u8, val_str);
+            cli_source.smtp_server = true;
+        }
+        // SMTP 端口
+        else if (std.mem.eql(u8, arg, "--smtp-port")) {
+            const val_str = args.next() orelse {
+                std.debug.print("错误: --smtp-port 选项缺少参数值\n", .{});
+                return error.MissingArgumentValue;
+            };
+            cli_config.smtp_port = try allocator.dupe(u8, val_str);
+            cli_source.smtp_port = true;
+        }
+        // SMTP 用户名
+        else if (std.mem.eql(u8, arg, "--smtp-user")) {
+            const val_str = args.next() orelse {
+                std.debug.print("错误: --smtp-user 选项缺少参数值\n", .{});
+                return error.MissingArgumentValue;
+            };
+            cli_config.smtp_user = try allocator.dupe(u8, val_str);
+            cli_source.smtp_user = true;
+        }
+        // SMTP 密码
+        else if (std.mem.eql(u8, arg, "--smtp-pass")) {
+            const val_str = args.next() orelse {
+                std.debug.print("错误: --smtp-pass 选项缺少参数值\n", .{});
+                return error.MissingArgumentValue;
+            };
+            cli_config.smtp_pass = try allocator.dupe(u8, val_str);
+            cli_source.smtp_pass = true;
+        }
+        // SMTP 发件人
+        else if (std.mem.eql(u8, arg, "--smtp-from")) {
+            const val_str = args.next() orelse {
+                std.debug.print("错误: --smtp-from 选项缺少参数值\n", .{});
+                return error.MissingArgumentValue;
+            };
+            cli_config.smtp_from = try allocator.dupe(u8, val_str);
+            cli_source.smtp_from = true;
+        }
+        // SMTP 收件人
+        else if (std.mem.eql(u8, arg, "--smtp-to")) {
+            const val_str = args.next() orelse {
+                std.debug.print("错误: --smtp-to 选项缺少参数值\n", .{});
+                return error.MissingArgumentValue;
+            };
+            cli_config.smtp_to = try allocator.dupe(u8, val_str);
+            cli_source.smtp_to = true;
+        }
+        // 手动恢复网络并重置配额
+        else if (std.mem.eql(u8, arg, "--resume")) {
+            cli_config.restore_network = true;
+            cli_source.restore_network = true;
+        }
+        // 配额重置日（1-28）
+        else if (std.mem.eql(u8, arg, "--reset-day")) {
+            const val_str = args.next() orelse {
+                std.debug.print("错误: --reset-day 选项缺少参数值\n", .{});
+                return error.MissingArgumentValue;
+            };
+            cli_config.reset_day = std.fmt.parseInt(u8, val_str, 10) catch {
+                std.debug.print("错误: --reset-day 参数值 '{s}' 不是有效数字!\n", .{val_str});
+                return error.InvalidArgumentValue;
+            };
+            cli_source.reset_day = true;
         }
         // 帮助
         else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
@@ -142,13 +352,85 @@ pub fn parseArgs(allocator: Allocator, args_vec: std.process.Args) !AppConfig {
         }
     }
 
-    // 验证互斥选项
-    if (config.daemon_mode and config.foreground) {
-        std.debug.print("错误: --daemon 和 --foreground/-f 不能同时使用\n", .{});
-        return error.ConflictingOptions;
+    // Merge configs: CLI takes precedence over file
+    // Convert cli_config to cfg.Config for merging
+    const cli_cfg_config = cfg.Config{
+        .interface = cli_config.interface,
+        .interval_sec = cli_config.interval_sec,
+        .daemon_mode = cli_config.daemon_mode,
+        .foreground = cli_config.foreground,
+        .use_sqlite = cli_config.use_sqlite,
+        .retention_days = cli_config.retention_days,
+        .log_file = cli_config.log_file,
+        .pid_file = cli_config.pid_file,
+        .list_only = cli_config.list_only,
+        .day_count = cli_config.day_count,
+        .quota_limit_bytes = cli_config.quota_limit_bytes,
+        .quota_warning_threshold = cli_config.quota_warning_threshold,
+        .quota_disconnect_threshold = cli_config.quota_disconnect_threshold,
+        .quota_reset_day = cli_config.quota_reset_day,
+        .reset_day = cli_config.reset_day,
+        .webhook_url = cli_config.webhook_url,
+        .smtp_server = cli_config.smtp_server,
+        .smtp_port = cli_config.smtp_port,
+        .smtp_user = cli_config.smtp_user,
+        .smtp_pass = cli_config.smtp_pass,
+        .smtp_from = cli_config.smtp_from,
+        .smtp_to = cli_config.smtp_to,
+        .restore_network = cli_config.restore_network,
+    };
+    const merged = cfg.mergeConfigs(file_config, cli_cfg_config, cli_source);
+
+    // Convert to AppConfig
+    const result = AppConfig{
+        .interval_sec = merged.interval_sec,
+        .interface = merged.interface,
+        .list_only = merged.list_only,
+        .day_count = merged.day_count,
+        .interval_explicit = cli_config.interval_explicit or file_source.interval_sec,
+        .daemon_mode = merged.daemon_mode,
+        .foreground = merged.foreground,
+        .log_file = merged.log_file,
+        .pid_file = merged.pid_file,
+        .retention_days = merged.retention_days,
+        .use_sqlite = merged.use_sqlite,
+        // Quota 配置
+        .quota_limit_bytes = merged.quota_limit_bytes,
+        .quota_warning_threshold = merged.quota_warning_threshold,
+        .quota_disconnect_threshold = merged.quota_disconnect_threshold,
+        .quota_reset_day = merged.quota_reset_day,
+        // 通知配置
+        .webhook_url = merged.webhook_url,
+        .smtp_server = merged.smtp_server,
+        .smtp_port = merged.smtp_port,
+        .smtp_user = merged.smtp_user,
+        .smtp_pass = merged.smtp_pass,
+        .smtp_from = merged.smtp_from,
+        .smtp_to = merged.smtp_to,
+        // 运行时控制
+        .restore_network = merged.restore_network,
+        .reset_day = merged.reset_day,
+    };
+
+    // Validate
+    cfg.validateConfig(.{
+        .interval_sec = result.interval_sec,
+        .daemon_mode = result.daemon_mode,
+        .foreground = result.foreground,
+        .retention_days = result.retention_days,
+        .day_count = result.day_count,
+    }) catch |err| {
+        std.debug.print("错误: 配置验证失败: {s}\n", .{@errorName(err)});
+        return err;
+    };
+
+    // Validate reset_day range (1-28)
+    if (result.reset_day < 1 or result.reset_day > 28) {
+        std.debug.print("错误: --reset-day 必须在 1-28 之间\n", .{});
+        return error.InvalidArgumentValue;
     }
 
-    return config;
+    return result;
 }
 
 fn printHelp() void {
@@ -162,6 +444,7 @@ fn printHelp() void {
         \\  -i, --interface <名>       指定监听网卡（例如: eth0, wlan0）
         \\  -l, --list                 列出系统所有网卡后退出
         \\  -D, --day <天数>           显示最近 N 天流量统计（最多显示 3 天详情）
+        \\  --config <路径>            指定配置文件路径（JSON 格式）
         \\  -h, --help                 显示帮助信息
         \\
         \\守护进程选项:
@@ -175,13 +458,57 @@ fn printHelp() void {
         \\  --sqlite                   使用 SQLite 存储
         \\  --no-sqlite                禁用 SQLite 存储（默认）
         \\
+        \\配额管理选项:
+        \\  --quota-limit <大小>       月度流量配额（支持: 100GB, 500MB, 1TB）
+        \\  --quota-warning <比例>     警告阈值（0.0-1.0，默认: 0.9）
+        \\  --quota-disconnect <比例>  断网阈值（0.0-1.0，默认: 1.0）
+        \\  --quota-reset-day <日期>   配额每月重置日（1-28，默认: 1）
+        \\  --resume                   手动恢复网络并重置配额状态
+        \\  --reset-day <日期>         配额每月重置日（1-28，默认: 1）
+        \\
+        \\通知配置选项:
+        \\  --webhook-url <URL>        Webhook 通知地址
+        \\  --smtp-server <地址>       SMTP 服务器地址
+        \\  --smtp-port <端口>         SMTP 端口（默认: 25）
+        \\  --smtp-user <用户名>       SMTP 认证用户名
+        \\  --smtp-pass <密码>         SMTP 认证密码
+        \\  --smtp-from <地址>         SMTP 发件人地址
+        \\  --smtp-to <地址>           SMTP 收件人地址
+        \\
         \\示例:
         \\  traffic-backend                自动选择默认网卡，每秒采样一次
         \\  traffic-backend -d 2 -i eth0   每 2 秒采样一次 eth0
         \\  traffic-backend -l             查看系统有哪些网卡
         \\  traffic-backend -D 3           显示最近 3 天的流量统计
+        \\  traffic-backend --config /etc/traffic-manager.json
+        \\                                 使用配置文件运行
         \\  traffic-backend --daemon --pid-file /tmp/traffic.pid
         \\                                 以守护进程模式运行
+        \\  traffic-backend --resume       恢复网络并重置配额
+        \\
+        \\配置文件格式 (JSON):
+        \\  {{{{
+        \\      "interface": "eth0",
+        \\      "interval_sec": 5,
+        \\      "daemon_mode": false,
+        \\      "use_sqlite": true,
+        \\      "retention_days": 60,
+        \\      "log_file": "/var/log/traffic-manager.log",
+        \\      "pid_file": "/var/run/traffic-manager.pid",
+        \\      "reset_day": 1,
+        \\      "quota_limit_bytes": 107374182400,
+        \\      "quota_warning_threshold": 0.9,
+        \\      "quota_disconnect_threshold": 1.0,
+        \\      "webhook_url": "https://hooks.example.com/notify",
+        \\      "smtp_server": "smtp.example.com",
+        \\      "smtp_port": "587",
+        \\      "smtp_user": "user@example.com",
+        \\      "smtp_pass": "password",
+        \\      "smtp_from": "traffic@example.com",
+        \\      "smtp_to": "admin@example.com"
+        \\  }}}}
+        \\
+        \\注: 命令行参数优先于配置文件中的同名选项
         \\
     , .{});
 }
@@ -193,14 +520,21 @@ pub fn main(init: std.process.Init) !void {
     const home_dir = init.environ_map.get("HOME");
 
     // 先解析参数，以便判断是否需要 daemonize
-    var config = try parseArgs(init.gpa, init.minimal.args);
-    defer if (config.interface) |iface| init.gpa.free(iface);
-    defer if (config.log_file) |path| init.gpa.free(path);
-    defer if (config.pid_file) |path| init.gpa.free(path);
+    var app_config = try parseArgs(init.io, init.gpa, init.minimal.args);
+    defer if (app_config.interface) |iface| init.gpa.free(iface);
+    defer if (app_config.log_file) |path| init.gpa.free(path);
+    defer if (app_config.pid_file) |path| init.gpa.free(path);
+    defer if (app_config.webhook_url) |url| init.gpa.free(url);
+    defer if (app_config.smtp_server) |s| init.gpa.free(s);
+    defer if (app_config.smtp_port) |p| init.gpa.free(p);
+    defer if (app_config.smtp_user) |u| init.gpa.free(u);
+    defer if (app_config.smtp_pass) |p| init.gpa.free(p);
+    defer if (app_config.smtp_from) |f| init.gpa.free(f);
+    defer if (app_config.smtp_to) |t| init.gpa.free(t);
 
     // ── Daemon 模式 ──────────────────────────────────────────────────────
     var io = init.io;
-    if (config.daemon_mode and !config.foreground) {
+    if (app_config.daemon_mode and !app_config.foreground) {
         const result = try daemon.daemonize();
         switch (result) {
             .parent => {
@@ -217,7 +551,50 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    try runDemo(io, init.gpa, &config, home_dir);
+    try runDemo(io, init.gpa, &app_config, home_dir);
+}
+
+/// Handle --resume command: restore network interface and reset quota state
+fn handleResume(io: std.Io, allocator: Allocator, config: *AppConfig) !void {
+    // Get current time for logging
+    const now_ms = std.Io.Timestamp.now(io, .real).nanoseconds;
+    const now_secs: u64 = @intCast(@divTrunc(now_ms, std.time.ns_per_s));
+    
+    try printOut(io, "\n============ 恢复网络配额 ============\n", .{});
+    
+    // Determine which interface to restore
+    const iface = if (config.interface) |name|
+        try allocator.dupe(u8, name)
+    else
+        traffic.findDefaultInterface(allocator, io) catch |err| {
+            std.debug.print("错误: 未找到可用网卡 ({s})，请用 -i <name> 手动指定\n", .{@errorName(err)});
+            return err;
+        };
+    defer allocator.free(iface);
+    
+    // Check current interface status
+    const is_up = if (network.queryInterfaceStatus(iface)) |up| up else |_| false;
+    
+    if (is_up) {
+        try printOut(io, "接口 {s} 已经是 UP 状态，无需恢复\n", .{iface});
+    } else {
+        // Restore interface
+        network.restoreInterface(iface) catch |err| {
+            std.debug.print("错误: 无法恢复接口 {s}: {s}\n", .{ iface, @errorName(err) });
+            return err;
+        };
+        try printOut(io, "✓ 接口 {s} 已恢复 (UP)\n", .{iface});
+    }
+    
+    // Reset quota state
+    quota.resetQuotaState(allocator);
+    try printOut(io, "✓ 配额状态已重置\n", .{});
+    
+    // Log the restore event
+    var time_buf: [20]u8 = undefined;
+    const timestamp = formatTimestampFull(&time_buf, now_secs);
+    try printOut(io, "✓ 恢复操作完成于 {s}\n", .{timestamp});
+    try printOut(io, "=========================================\n\n", .{});
 }
 
 /// 全局退出标志，由信号处理器置位
@@ -246,6 +623,22 @@ fn installSignalHandlers() void {
 }
 
 fn runDemo(io: std.Io, allocator: Allocator, config: *AppConfig, home_dir: ?[]const u8) !void {
+    // Handle --resume command first
+    if (config.restore_network) {
+        try handleResume(io, allocator, config);
+        return;
+    }
+    
+    // Check for auto-restore on startup (monthly reset day)
+    const now_ms = std.Io.Timestamp.now(io, .real).nanoseconds;
+    const now_secs: u64 = @intCast(@divTrunc(now_ms, std.time.ns_per_s));
+    
+    if (quota.shouldRestore(config.reset_day, now_secs)) {
+        try printOut(io, "\n[自动恢复] 检测到今日是配额重置日 (第 {d} 天)\n", .{config.reset_day});
+        try handleResume(io, allocator, config);
+        return;
+    }
+    
     if (config.list_only) {
         try printInterfaceList(io, allocator);
         return;
@@ -415,12 +808,43 @@ fn runLiveMonitorSqlite(io: std.Io, allocator: Allocator, config: AppConfig, sto
 
     var tracker = traffic.TrafficTracker.init(null);
 
+    // ── 配额状态跟踪 ──
+    var prev_quota_state: quota.QuotaState = .disabled;
+    var is_disconnected: bool = false;
+    var last_quota_check_ms: i64 = 0;
+    const quota_check_interval_ms: i64 = 60 * 1000; // 每分钟检查一次配额
+    var rx_total_buf: [24]u8 = undefined;
+    var tx_total_buf: [24]u8 = undefined;
+
+    // 初始化全局日志（可选，失败时继续运行）
+    if (config.log_file) |log_path| {
+        log.initGlobal(allocator, io, log_path, .info_level) catch |err| {
+            std.debug.print("警告: 无法初始化日志 ({s})，日志功能已禁用\n", .{@errorName(err)});
+        };
+    }
+    defer log.deinitGlobal();
+
+    // 配额信息输出
     try printOut(io, "\n============ Traffic Manager (SQLite) ============\n", .{});
     try printOut(io, "  网卡: {s}    采样间隔: {d} 秒    保留: {d} 天    按 Ctrl+C 退出\n", .{
         iface,
         config.interval_sec,
         config.retention_days,
     });
+    if (config.quota_limit_bytes > 0) {
+        try printOut(io, "  配额: {s}    警告: {d:.0}%    断网: {d:.0}%    重置日: 每月 {d} 日\n", .{
+            formatBytes(&rx_total_buf, config.quota_limit_bytes, ""),
+            config.quota_warning_threshold * 100,
+            config.quota_disconnect_threshold * 100,
+            config.quota_reset_day,
+        });
+    }
+    if (config.webhook_url) |url| {
+        try printOut(io, "  Webhook: {s}\n", .{url});
+    }
+    if (config.smtp_server) |server| {
+        try printOut(io, "  SMTP: {s}:{s}\n", .{ server, config.smtp_port orelse "25" });
+    }
     try printOut(io, "--------------------------------------------------------------\n", .{});
     try printOut(io, "  时间          ↓ 下行速率      ↑ 上行速率      ↓ PPS    ↑ PPS    累计下行        累计上行\n", .{});
     try printOut(io, "--------------------------------------------------------------\n", .{});
@@ -428,8 +852,6 @@ fn runLiveMonitorSqlite(io: std.Io, allocator: Allocator, config: AppConfig, sto
     var time_buf: [16]u8 = undefined;
     var rx_speed_buf: [24]u8 = undefined;
     var tx_speed_buf: [24]u8 = undefined;
-    var rx_total_buf: [24]u8 = undefined;
-    var tx_total_buf: [24]u8 = undefined;
 
     while (!should_exit.load(.acquire)) {
         const stats = tracker.update(iface, allocator, io) catch |err| {
@@ -453,6 +875,74 @@ fn runLiveMonitorSqlite(io: std.Io, allocator: Allocator, config: AppConfig, sto
             std.debug.print("SQLite 写入失败: {s}\n", .{@errorName(err)});
         };
 
+        // ── 配额检查（每分钟执行一次） ──
+        if (config.quota_limit_bytes > 0 and stats.timestamp_ms - last_quota_check_ms >= quota_check_interval_ms) {
+            last_quota_check_ms = stats.timestamp_ms;
+
+            // 计算当月第一天的 epoch day
+            const now_secs: u64 = @intCast(@divTrunc(stats.timestamp_ms, std.time.ns_per_s));
+            const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = now_secs };
+            const epoch_day = epoch_seconds.getEpochDay();
+            const year_day = epoch_day.calculateYearDay();
+            const month_day = year_day.calculateMonthDay();
+            const first_day = quota.firstDayOfMonthEpochDay(year_day.year, month_day.month.numeric());
+
+            // 查询当月流量
+            const monthly_traffic = quota.getMonthlyTraffic(&stor.conn, @intCast(first_day)) catch |err| {
+                log.warn("配额查询失败: {s}", .{@errorName(err)});
+                continue;
+            };
+
+            // 检查配额状态
+            const quota_config = quota.QuotaConfig{
+                .limit_bytes = config.quota_limit_bytes,
+                .warning_threshold = config.quota_warning_threshold,
+                .disconnect_threshold = config.quota_disconnect_threshold,
+                .reset_day = config.quota_reset_day,
+            };
+            const current_state = quota.checkQuota(quota_config, monthly_traffic);
+
+            // 检测状态转换并触发通知
+            if (current_state != prev_quota_state) {
+                // 状态发生变化，记录日志
+                log.info("配额状态变化: {s} -> {s} (已用: {s}/{s})", .{
+                    @tagName(prev_quota_state),
+                    @tagName(current_state),
+                    formatBytes(&rx_total_buf, monthly_traffic, ""),
+                    formatBytes(&tx_total_buf, config.quota_limit_bytes, ""),
+                });
+
+                // 发送通知
+                sendQuotaNotification(
+                    allocator,
+                    io,
+                    config,
+                    iface,
+                    monthly_traffic,
+                    current_state,
+                );
+
+                // 处理断网/恢复
+                if (current_state == .exceeded and !is_disconnected) {
+                    // 超限，断开网络
+                    network.disconnectInterface(iface) catch |err| {
+                        log.err("断网失败: {s}", .{@errorName(err)});
+                    };
+                    is_disconnected = true;
+                    log.info("已断开网络接口: {s}", .{iface});
+                } else if (current_state == .normal and is_disconnected) {
+                    // 恢复正常，恢复网络
+                    network.restoreInterface(iface) catch |err| {
+                        log.err("恢复网络失败: {s}", .{@errorName(err)});
+                    };
+                    is_disconnected = false;
+                    log.info("已恢复网络接口: {s}", .{iface});
+                }
+
+                prev_quota_state = current_state;
+            }
+        }
+
         // 使用 clock_nanosleep（保证被信号中断，不会自动重启）
         const sleep_ns: u64 = config.interval_sec * std.time.ns_per_s;
         var req = std.os.linux.timespec{ .sec = @intCast(@divTrunc(sleep_ns, std.time.ns_per_s)), .nsec = @intCast(@mod(sleep_ns, std.time.ns_per_s)) };
@@ -465,6 +955,191 @@ fn runLiveMonitorSqlite(io: std.Io, allocator: Allocator, config: AppConfig, sto
     stor.save() catch |err| {
         std.debug.print("SQLite 保存失败: {s}\n", .{@errorName(err)});
     };
+
+    // 如果网络被断开，尝试恢复
+    if (is_disconnected) {
+        network.restoreInterface(iface) catch {};
+        log.info("程序退出，已恢复网络接口: {s}", .{iface});
+    }
+}
+
+/// 发送配额通知（通过 Webhook 和/或 SMTP）
+fn sendQuotaNotification(
+    allocator: Allocator,
+    io: std.Io,
+    config: AppConfig,
+    iface: []const u8,
+    used_bytes: u64,
+    state: quota.QuotaState,
+) void {
+    const timestamp_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
+
+    // 构建模板变量
+    const vars = notify_template.TemplateVariables{
+        .interface = iface,
+        .quota = config.quota_limit_bytes,
+        .used = used_bytes,
+        .percent = if (config.quota_limit_bytes > 0)
+            @as(f64, @floatFromInt(used_bytes)) / @as(f64, @floatFromInt(config.quota_limit_bytes)) * 100.0
+        else
+            0.0,
+        .timestamp_ms = timestamp_ms,
+    };
+
+    // 选择模板
+    const template = switch (state) {
+        .warned => notify_template.default_warning_template,
+        .exceeded => notify_template.default_disconnect_template,
+        else => return, // normal/disabled 状态不发送通知
+    };
+
+    // 渲染消息
+    var msg_buf: [4096]u8 = undefined;
+    const message = notify_template.render(allocator, template, vars, &msg_buf) catch |err| {
+        log.err("模板渲染失败: {s}", .{@errorName(err)});
+        return;
+    };
+
+    // 通过 Webhook 发送
+    if (config.webhook_url) |url| {
+        var notifier = webhook.WebhookNotifier.init(allocator, io, url);
+        const result = notifier.sendTrafficAlert(
+            iface,
+            used_bytes,
+            0, // tx_bytes (我们使用总流量)
+            config.quota_limit_bytes,
+        ) catch |err| {
+            log.err("Webhook 通知失败: {s}", .{@errorName(err)});
+            return;
+        };
+        if (result.success) {
+            log.info("Webhook 通知已发送", .{});
+        } else {
+            log.warn("Webhook 通知失败 (HTTP {d})", .{result.status});
+        }
+    }
+
+    // 通过 SMTP 发送（如果配置了）
+    if (config.smtp_server) |server| {
+        // 检查必要的 SMTP 配置
+        const from_addr = config.smtp_from orelse {
+            log.warn("SMTP: 缺少发件人地址 (--smtp-from)，跳过 SMTP 通知", .{});
+            return;
+        };
+        const to_addr = config.smtp_to orelse {
+            log.warn("SMTP: 缺少收件人地址 (--smtp-to)，跳过 SMTP 通知", .{});
+            return;
+        };
+
+        // 分配以零结尾的字符串副本（C API 需要）
+        const zt_server = allocator.dupeZ(u8, server) catch {
+            log.err("SMTP: 内存分配失败", .{});
+            return;
+        };
+        defer allocator.free(zt_server);
+
+        const port_str = config.smtp_port orelse "25";
+        const zt_port = allocator.dupeZ(u8, port_str) catch {
+            log.err("SMTP: 内存分配失败", .{});
+            return;
+        };
+        defer allocator.free(zt_port);
+
+        // 根据端口确定安全模式
+        const security: smtp.Security = if (std.mem.eql(u8, port_str, "465"))
+            .tls
+        else if (std.mem.eql(u8, port_str, "587"))
+            .starttls
+        else
+            .none;
+
+        // 根据用户名确定认证方式
+        const auth_method: smtp.AuthMethod = if (config.smtp_user != null)
+            .plain
+        else
+            .none;
+
+        // 准备认证凭据
+        var zt_user: ?[:0]const u8 = null;
+        var zt_pass: ?[:0]const u8 = null;
+        defer {
+            if (zt_user) |u| allocator.free(u);
+            if (zt_pass) |p| allocator.free(p);
+        }
+        if (config.smtp_user) |user| {
+            zt_user = allocator.dupeZ(u8, user) catch {
+                log.err("SMTP: 内存分配失败", .{});
+                return;
+            };
+        }
+        if (config.smtp_pass) |pass| {
+            zt_pass = allocator.dupeZ(u8, pass) catch {
+                log.err("SMTP: 内存分配失败", .{});
+                return;
+            };
+        }
+
+        const zt_from = allocator.dupeZ(u8, from_addr) catch {
+            log.err("SMTP: 内存分配失败", .{});
+            return;
+        };
+        defer allocator.free(zt_from);
+
+        const zt_to = allocator.dupeZ(u8, to_addr) catch {
+            log.err("SMTP: 内存分配失败", .{});
+            return;
+        };
+        defer allocator.free(zt_to);
+
+        // 根据状态生成邮件主题
+        const subject_str = switch (state) {
+            .warned => "Traffic Manager: 配额警告",
+            .exceeded => "Traffic Manager: 配额超限 - 已断网",
+            else => "Traffic Manager: 通知",
+        };
+        const zt_subject = allocator.dupeZ(u8, subject_str) catch {
+            log.err("SMTP: 内存分配失败", .{});
+            return;
+        };
+        defer allocator.free(zt_subject);
+
+        // 使用渲染后的消息作为邮件正文
+        const zt_body = allocator.dupeZ(u8, message) catch {
+            log.err("SMTP: 内存分配失败", .{});
+            return;
+        };
+        defer allocator.free(zt_body);
+
+        // 发送邮件
+        smtp.sendEmail(
+            allocator,
+            zt_server,
+            zt_port,
+            security,
+            auth_method,
+            zt_user orelse "",
+            zt_pass orelse "",
+            zt_from,
+            zt_to,
+            zt_subject,
+            zt_body,
+        ) catch |err| {
+            log.err("SMTP 通知发送失败: {s}", .{@errorName(err)});
+            return;
+        };
+
+        log.info("SMTP 通知已发送至 {s}", .{to_addr});
+    }
+
+    // 记录到日志文件
+    var rx_buf: [24]u8 = undefined;
+    var tx_buf: [24]u8 = undefined;
+    log.info("[配额] {s}: {s} (已用: {s}/{s})", .{
+        @tagName(state),
+        iface,
+        formatBytes(&rx_buf, used_bytes, ""),
+        formatBytes(&tx_buf, config.quota_limit_bytes, ""),
+    });
 }
 
 fn printInterfaceList(io: std.Io, allocator: Allocator) !void {
@@ -638,6 +1313,22 @@ fn formatTimestamp(buf: []u8, timestamp_ms: i64) []const u8 {
     }) catch "??:??:??";
 }
 
+/// 将秒时间戳格式化为 YYYY-MM-DD HH:MM:SS
+fn formatTimestampFull(buf: []u8, timestamp_secs: u64) []const u8 {
+    const es = std.time.epoch.EpochSeconds{ .secs = timestamp_secs };
+    const yd = es.getEpochDay().calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const ds = es.getDaySeconds();
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
+        yd.year,
+        md.month.numeric(),
+        md.day_index + 1,
+        ds.getHoursIntoDay(),
+        ds.getMinutesIntoHour(),
+        ds.getSecondsIntoMinute(),
+    }) catch "0000-00-00 00:00:00";
+}
+
 /// 将字节数格式化为人类可读形式，如 "1.5 MB"，suffix 用于附加 "/s" 等后缀
 fn formatBytes(buf: []u8, bytes: u64, comptime suffix: []const u8) []const u8 {
     const units = [_][]const u8{ "B", "KB", "MB", "GB", "TB", "PB" };
@@ -675,4 +1366,7 @@ test {
     std.testing.refAllDecls(pidfile);
     std.testing.refAllDecls(daemon);
     std.testing.refAllDecls(log);
+    std.testing.refAllDecls(webhook);
+    std.testing.refAllDecls(cfg);
+    std.testing.refAllDecls(quota);
 }

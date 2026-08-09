@@ -59,10 +59,16 @@ pub const Logger = struct {
     };
 
     /// Initialize logger with specified or default path.
+    /// Always duplicates the provided path so Logger owns its own copy.
     /// Tries /var/log/traffic-manager.log first, falls back to /tmp/traffic-manager.log.
     pub fn init(allocator: Allocator, io: Io, file_path: ?[]const u8, min_level: LogLevel) InitError!Logger {
-        const path = file_path orelse try resolveDefaultPath(allocator, io);
-        errdefer if (file_path == null) allocator.free(path);
+        // Always duplicate the path — both caller-provided and resolved paths
+        // are owned by Logger and freed in deinit.
+        const path = if (file_path) |fp|
+            try allocator.dupe(u8, fp)
+        else
+            try resolveDefaultPath(allocator, io);
+        errdefer allocator.free(path);
 
         // Ensure directory exists
         if (std.fs.path.dirname(path)) |dir| {
@@ -175,17 +181,17 @@ pub const Logger = struct {
             error.NoSpaceLeft => return,
         };
 
-        // Open file in append mode
-        const file = std.Io.Dir.createFileAbsolute(self.io, self.file_path, .{
-            .truncate = false,
-            .mode = .write_only,
-        }) catch return;
+        // Open file for appending (O_APPEND ensures writes go to end of file)
+        const fd = std.posix.openat(std.posix.AT.FDCWD, self.file_path, .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .APPEND = true,
+        }, 0o644) catch return;
+
+        var file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
         defer file.close(self.io);
 
-        // Seek to end for append
-        file.seekTo(self.io, self.current_size) catch return;
-
-        // Write the log line
+        // Write the log line (O_APPEND ensures it goes to end of file)
         file.writeStreamingAll(self.io, full_line) catch return;
 
         self.current_size += full_line.len;
@@ -203,7 +209,7 @@ pub const Logger = struct {
         std.Io.Dir.deleteFileAbsolute(self.io, rotated_path) catch {};
 
         // Rename current to rotated
-        std.Io.Dir.renameAbsolute(self.io, self.file_path, rotated_path) catch {};
+        std.Io.Dir.renameAbsolute(self.file_path, rotated_path, self.io) catch {};
 
         // Reset size counter
         self.current_size = 0;
@@ -301,4 +307,73 @@ test "LogLevel intValue ordering" {
     try std.testing.expect(LogLevel.err_level.intValue() < LogLevel.warn_level.intValue());
     try std.testing.expect(LogLevel.warn_level.intValue() < LogLevel.info_level.intValue());
     try std.testing.expect(LogLevel.info_level.intValue() < LogLevel.debug_level.intValue());
+}
+
+test "Logger appends to file instead of overwriting" {
+    // Create a temporary file path for testing
+    const test_path = "/tmp/traffic-manager-test-append.log";
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    // Clean up any existing test file
+    std.Io.Dir.deleteFileAbsolute(io, test_path) catch {};
+
+    const allocator = std.testing.allocator;
+
+    // Initialize logger
+    var logger = Logger.init(allocator, io, test_path, .debug_level) catch return;
+    defer logger.deinit();
+
+    // Write first log entry
+    logger.log(.info_level, "First entry: {s}", .{"hello"});
+
+    // Read file to verify first entry
+    {
+        const file = std.Io.Dir.openFileAbsolute(io, test_path, .{ .mode = .read_only }) catch return;
+        defer file.close(io);
+        var buf: [1024]u8 = undefined;
+        const bytes_read = file.readPositionalAll(io, &buf, 0) catch return;
+        const content = buf[0..bytes_read];
+        try std.testing.expect(std.mem.indexOf(u8, content, "First entry: hello") != null);
+    }
+
+    // Write second log entry
+    logger.log(.info_level, "Second entry: {s}", .{"world"});
+
+    // Read file to verify BOTH entries exist (append, not overwrite)
+    {
+        const file = std.Io.Dir.openFileAbsolute(io, test_path, .{ .mode = .read_only }) catch return;
+        defer file.close(io);
+        var buf: [1024]u8 = undefined;
+        const bytes_read = file.readPositionalAll(io, &buf, 0) catch return;
+        const content = buf[0..bytes_read];
+        try std.testing.expect(std.mem.indexOf(u8, content, "First entry: hello") != null);
+        try std.testing.expect(std.mem.indexOf(u8, content, "Second entry: world") != null);
+    }
+
+    // Clean up
+    std.Io.Dir.deleteFileAbsolute(io, test_path) catch {};
+}
+
+test "Logger init owns its own copy of file_path (BUG-4 regression)" {
+    // Use /tmp which should always exist on Linux
+    const test_path = "/tmp/traffic-manager-test-log.txt";
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const allocator = std.testing.allocator;
+
+    // Simulate what main.zig does: parseArgs allocates a dupe of the CLI arg
+    const caller_owned_path = try allocator.dupe(u8, test_path);
+    defer allocator.free(caller_owned_path);
+
+    // Logger.init should create its OWN copy (not store the caller's pointer)
+    var logger = Logger.init(allocator, io, caller_owned_path, .info_level) catch return;
+    // logger.deinit frees its own copy; main.zig frees caller_owned_path separately.
+    // Before the fix, both freed the same pointer → double-free.
+    logger.deinit();
+
+    // Caller's pointer is still valid and freeable independently (no double-free)
+    // (freed by defer above)
+
+    // Cleanup test file if created
+    std.Io.Dir.deleteFileAbsolute(io, test_path) catch {};
 }
