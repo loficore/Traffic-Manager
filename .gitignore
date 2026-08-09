@@ -3,10 +3,9 @@
 **/zig-out/
 
 .omo/
-
 .jj*.json
-
 AGENTS.md
+**/.opencode/**
 
 backend/root
 
