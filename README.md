@@ -34,6 +34,43 @@ Run the test suite:
 zig build test
 ```
 
+### Frontend
+
+The web dashboard is a Preact + Tailwind CSS single-page app in `frontend/`.
+
+Prerequisites: **pnpm >= 11.17** (declared in `frontend/package.json` under `engines`).
+
+```bash
+cd frontend
+pnpm install      # install dependencies
+pnpm dev          # start the Vite dev server on :5173 (proxies /api -> :8080)
+pnpm build        # produce a single self-contained dist/index.html
+```
+
+`pnpm build` emits one self-contained `dist/index.html` via `vite-plugin-singlefile`. That file is copied to `backend/src/dashboard.html` and embedded into the binary with `@embedFile`, so the running backend serves it from memory.
+
+To build the entire project in one step, use `just`:
+
+```bash
+just build        # frontend pnpm build -> copy dist/index.html -> zig build
+```
+
+### Development mode
+
+For live dashboard development, run the Zig backend with the HTTP server enabled in one terminal:
+
+```bash
+zig build run -- --sqlite --web-port 8080
+```
+
+and the frontend dev server in another:
+
+```bash
+cd frontend && pnpm dev
+```
+
+`pnpm dev` (Vite on port **5173**) proxies every `/api` request to the backend on `http://localhost:8080`, so you can edit the UI without rebuilding the binary. Open `http://localhost:5173` in a browser.
+
 ## Usage
 
 ### Foreground mode
@@ -110,6 +147,20 @@ zig build run -- --daemon -d 5 -i eth0 --sqlite \
 
 The `--daemon` and `--foreground` flags are mutually exclusive. Daemon mode performs a classic Unix double-fork: the original parent exits, the grandchild runs in its own session with stdin/stdout/stderr redirected to `/dev/null`.
 
+### Web Dashboard
+
+The backend can serve a bundled web dashboard over HTTP. Build the frontend, then run with `--sqlite` and an explicit listen port:
+
+```bash
+zig build run -- --sqlite --web-port 8080
+```
+
+Open `http://localhost:8080` in a browser. The dashboard has four tabs — **Dashboard**, **Traffic History**, **Config**, and **Quota** — and talks to the backend through its REST API (see `backend/src/http_server.zig`).
+
+`--web-port` requires `--sqlite`: the HTTP server shares the SQLite connection and reads the config, quota, and daily-traffic tables, so it cannot run against the binary backend (the program refuses to start and reports the conflict). The port must be supplied explicitly; there is no built-in default, and `8080` is only the conventional choice shown above.
+
+The dashboard HTML is embedded into the binary at compile time (see the build flow below), so no separate web server or static files are needed at runtime.
+
 ## Command-line options
 
 | Option | Description | Default |
@@ -125,6 +176,9 @@ The `--daemon` and `--foreground` flags are mutually exclusive. Daemon mode perf
 | `--sqlite` | Use SQLite storage | |
 | `--no-sqlite` | Use binary file storage | Binary |
 | `--retention-days <n>` | Days to keep sample data | 30 |
+| `--web-port <port>` | HTTP listen port for the web dashboard (requires `--sqlite`) | Disabled |
+| `--quota-adjust <amount>` | One-off monthly quota adjustment, human-readable (e.g. `500MB`); repeatable; SQLite only | |
+| `--quota-adjust-reason <text>` | Reason paired with the most recent `--quota-adjust` | |
 | `-h`, `--help` | Show help | |
 
 ## Installing as a system service

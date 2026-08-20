@@ -13,3 +13,12 @@ backend/root
 
 # 静态库编译产物（构建生成，非源码）
 **/*.a
+
+# 前端构建产物（由 justfile 复制进包内，供 @embedFile 嵌入）
+backend/src/dashboard.html
+
+# Node.js 依赖（pnpm install 生成，非源码）
+frontend/node_modules/
+
+# 前端构建产物（pnpm build 生成，仅作复制进 backend/src/dashboard.html 的中间产物）
+frontend/dist/

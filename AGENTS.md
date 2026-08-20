@@ -1,22 +1,49 @@
 # AGENTS.md — TrafficManager
 
-## Project overview
+**Generated:** 2026-08-21 | **Commit:** 635a52b | **Branch:** HEAD (detached)
 
-Linux network traffic monitor. Zig 0.16 CLI backend that reads `/proc/net/dev`, computes per-second speeds, and persists daily totals. Supports two storage backends (binary file and SQLite) and a daemon mode for headless/embedded deployment. A TypeScript frontend skeleton exists but has no real code yet.
+## OVERVIEW
 
-## Repo structure
+Linux network traffic monitor. Zig 0.16 CLI backend reads `/proc/net/dev`, computes per-second speeds, persists daily totals. Two storage backends (binary + SQLite), daemon mode, quota management with webhook/SMTP notifications. Frontend is a Preact + Tailwind web dashboard (4 tabs: Dashboard / Traffic History / Config / Quota).
 
-- `backend/` — Zig 0.16 CLI application (`build.zig` + `src/`)
-  - `src/main.zig` — Entrypoint, arg parsing, live monitor loop, daemon orchestration
-  - `src/traffic.zig` — TrafficTracker, `/proc/net/dev` parsing, interface enumeration
-  - `src/storage.zig` — Binary persistence of DailyRecord (40 bytes each) to `$HOME/.local/share/traffic-manager/state.bin`
-  - `src/sqlite_storage.zig` — SQLite storage with WAL mode, buffered writes, auto-flush (5 min), data retention cleanup
-  - `src/sqlite_schema.zig` — SQLite schema definitions (samples + daily_summary tables, indexes)
-  - `src/daemon.zig` — Classic Unix double-fork daemon (setsid, fd redirect to /dev/null, umask, chdir)
-  - `src/pidfile.zig` — PID file management with flock(2) exclusive locking, duplicate instance detection
-  - `src/log.zig` — File-based logging with rotation (10 MB default), supports ERROR/WARN/INFO/DEBUG levels
-  - `src/root.zig` — Empty (unused)
-- `frontend/` — TypeScript skeleton; `index.ts` is a type-checking demo, not a real app
+## STRUCTURE
+
+```
+backend/
+├── build.zig, build.zig.zon    # Zig 0.16 build; no root-level build.zig
+├── src/                        # 17 .zig modules
+│   ├── main.zig                # Entrypoint, arg parsing, monitor loop, daemon orchestration
+│   ├── traffic.zig             # TrafficTracker, /proc/net/dev parsing, interface enumeration
+│   ├── config.zig              # Config types, TOML/JSON parsing, CLI merge, validation
+│   ├── config_store.zig        # SQLite-backed config key-value store (config table) with typed serialization; replaces the old JSON config, which auto-migrates on first run
+│   ├── network.zig             # Network interface connect/disconnect (ip link)
+│   ├── quota.zig               # Monthly traffic quota tracking, unit parsing, adjustment records
+│   ├── storage.zig             # Binary persistence (DailyRecord, 40-byte extern struct)
+│   ├── sqlite_storage.zig      # SQLite WAL, buffered writes, auto-flush (5 min), retention
+│   ├── sqlite_schema.zig       # SQLite table/index definitions
+│   ├── http_server.zig         # Threaded HTTP server exposing the REST API + embedded dashboard; pre-bound port, spinlock-protected shared state
+│   ├── daemon.zig              # Unix double-fork daemon (setsid, fd redirect, umask, chdir)
+│   ├── pidfile.zig             # PID file + flock(2) exclusive locking
+│   ├── log.zig                 # File logging with rotation (10 MB), ERROR/WARN/INFO/DEBUG
+│   ├── notify_template.zig     # Template-based notification rendering
+│   ├── webhook.zig             # HTTP webhook notifier
+│   ├── smtp.zig                # SMTP email sender (wraps vendor/smtp/smtp.c)
+│   └── root.zig                # Empty (0 bytes, unused)
+├── tests/                      # 10 standalone test files (public API, HTTP server, and integration)
+├── vendor/smtp/                # C SMTP client (96 KB smtp.c + smtp.h)
+├── scripts/                    # BusyBox init deployment script
+└── zig-pkg/                    # Vendored zqlite dep (gitignored, cached)
+frontend/                       # Preact + Tailwind web dashboard (single-file build)
+├── src/App.tsx                 # Real 4-tab dashboard (Dashboard/History/Config/Quota); panels inline
+├── src/components/             # Dashboard sub-components: TrafficChart, ConfigPanel, QuotaManager
+├── src/api.ts                  # REST API client targeting the backend /api/* endpoints
+├── src/format.ts               # Byte formatting + human-readable size parsing
+├── src/index.tsx              # Preact mount point (renders <App/> into #app)
+├── src/app.css                # Tailwind CSS entry
+├── vite.config.ts             # vite-plugin-singlefile; dev proxy /api -> :8080
+├── vitest.config.ts            # Vitest config (jsdom + preact preset); `pnpm test` runs *.test.ts(x)
+└── package.json               # pnpm >=11.17; dev/build/preview/test/typecheck scripts
+```
 
 ## Build & test commands
 
@@ -62,8 +89,16 @@ If ZLS reports errors but `zig build` compiles fine, the installed Zig version i
 - **SQLite storage** (`sqlite_storage.zig`): WAL mode, NORMAL synchronous. Two tables: `daily_traffic` (persistent daily totals) and `samples` (per-second samples, auto-cleaned by retention policy). Buffered writes with 5-minute auto-flush. Auto-migrates from binary format on database corruption/rebuild. Default path: `$HOME/.local/share/traffic-manager/traffic.db`.
 - **Binary storage** (`storage.zig`): `DailyRecord` is an `extern struct` (40 bytes, packed). Files are arrays of these records sorted by date descending. Path: `$HOME/.local/share/traffic-manager/state.bin` (falls back to `/tmp` if `$HOME` is unset).
 - **Overflow handling**: `calcDelta` in traffic.zig handles 32-bit counter wraparound and NIC reset scenarios.
-- **Test structure**: tests are `test` blocks inside source files, not separate files. `main.zig` has `test { std.testing.refAllDecls(...); }` which pulls in tests from all modules.
-- **Frontend**: `frontend/package.json` specifies pnpm >=11.17 as the package manager. The single `index.ts` is a TypeScript type-checking playground, not application code.
+- **Quota management** (`quota.zig`): monthly traffic quota tracking with unit parsing (KB/MB/GB/TB). Checks quota on each sample; triggers notification via webhook or SMTP when exceeded.
+- **Network control** (`network.zig`): disconnects and restores network interfaces via `ip link set {iface} down/up`. Used by quota enforcement to cut off traffic when quota is exceeded.
+- **Notifications** (`notify_template.zig`, `webhook.zig`, `smtp.zig`): template-based notification rendering supports webhook (HTTP POST) and SMTP email. SMTP wraps a C library in `vendor/smtp/smtp.c`.
+- - **Configuration** (`config.zig`): reads TOML config file, merges with CLI args, validates. Supports interface, interval, storage backend, quota, notification settings.
+- **Config storage** (`config_store.zig`): the SQLite `config` table is now the single source of truth for configuration, replacing the old JSON config file. On first run with `--sqlite`, any existing JSON config is migrated into SQLite (renamed to `.bak`). `GET`/`PUT /api/config` read and persist these values.
+- **HTTP server** (`http_server.zig`): runs in a separate OS thread. The listening socket is pre-bound in the calling thread (so a busy port fails fast at startup), then the accept loop runs in the spawned thread. All shared state (config pointer, per-request tracker, and the zqlite connection) is guarded by a custom spinlock, since Zig 0.16 removed `std.Thread.Mutex`. It serves the embedded dashboard at `GET /` and the REST API from `/api/*`. Requires `--sqlite`.
+- **Command-line flags**: `--web-port <port>` starts the HTTP server (requires `--sqlite`). `--quota-adjust <amount>` (repeatable, human-readable like `500MB`) plus `--quota-adjust-reason <text>` record one-off monthly quota adjustments; these are SQLite-only (ignored with a warning in binary mode) and written to the monthly adjustments table.
+- **Build flow**: `just build` runs `cd frontend && pnpm build`, copies `frontend/dist/index.html` to `backend/src/dashboard.html`, then `cd backend && zig build` embeds it via `@embedFile("dashboard.html")` in `http_server.zig`.
+- **Test structure**: dual-layer — inline `test` blocks in `src/*.zig` (pulled via `refAllDecls` in `main.zig`) plus 10 standalone test files in `tests/` (public API, HTTP server, integration). Both layers run via `zig build test`.
+- **Frontend**: `frontend/package.json` requires pnpm >=11.17. `src/App.tsx` is the real Preact + Tailwind dashboard (4 tabs: Dashboard / Traffic History / Config / Quota) with panels defined inline; `src/api.ts` is the REST client for the backend `/api/*` endpoints; `src/index.tsx` mounts the app.
 
 ## Version control
 
@@ -86,77 +121,6 @@ All code in this project must have comprehensive Chinese comments that explain l
 - **Line comments**: Use `//` for short explanations
 - **Doc comments**: Use `///` for functions, structs, and enums documentation
 - **Section comments**: Use `// ── Title ──` format for code section separators
-
-### Comment Content Requirements
-
-#### Function Comments
-```zig
-/// 计算两个时间戳之间的差值（毫秒）
-/// 
-/// 参数：
-///   - start: 起始时间戳（毫秒）
-///   - end: 结束时间戳（毫秒）
-/// 
-/// 返回：时间差值（毫秒），如果 start > end 则返回 0
-fn calcTimeDiff(start: u64, end: u64) u64 {
-    // 确保结束时间不早于开始时间
-    if (end <= start) return 0;
-    return end - start;
-}
-```
-
-#### Struct Comments
-```zig
-/// 网络流量统计信息
-/// 
-/// 包含采样时刻的上下行速率、包数和累计流量
-const TrafficStats = struct {
-    /// 采样时间戳（毫秒）
-    timestamp_ms: i64,
-    /// 下行速率（字节/秒）
-    rx_speed_bps: u64,
-    /// 上行速率（字节/秒）
-    tx_speed_bps: u64,
-};
-```
-
-#### Complex Logic Comments
-```zig
-// 处理 32 位计数器溢出情况
-// 当计数器重置（新值小于旧值）时，视为新的开始
-if (new_rx < old_rx) {
-    // 可能是计数器溢出或网卡重置
-    // 采用新值作为本次增量
-    delta_rx = new_rx;
-} else {
-    delta_rx = new_rx - old_rx;
-}
-```
-
-#### Code Section Separators
-```zig
-// ── 初始化阶段 ──
-// 加载配置文件
-const config = loadConfig();
-// 初始化数据库连接
-var db = try Database.open(config.db_path);
-
-// ── 主循环 ──
-while (!should_exit) {
-    // 采样网络流量
-    const stats = sampleTraffic();
-    // 更新数据库
-    try db.update(stats);
-}
-```
-
-### Comment Checklist
-
-- [ ] Do all public functions have doc comments?
-- [ ] Do complex algorithms have logic explanations?
-- [ ] Do business decisions have reasoning?
-- [ ] Are comments in Chinese?
-- [ ] Are comments concise?
 
 ### Prohibited Practices
 
