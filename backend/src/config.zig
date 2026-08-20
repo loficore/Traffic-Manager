@@ -45,8 +45,6 @@ pub const Config = struct {
     quota_warning_threshold: f64 = 0.9,
     /// Disconnect threshold fraction (0.0-1.0, default 1.0)
     quota_disconnect_threshold: f64 = 1.0,
-    /// Day of month to reset quota (1-28)
-    quota_reset_day: u8 = 1,
     // ── 通知配置 ──
     /// Webhook URL for notifications
     webhook_url: ?[]const u8 = null,
@@ -65,7 +63,7 @@ pub const Config = struct {
     // ── 运行时控制 ──
     /// Restore network and reset quota state
     restore_network: bool = false,
-    /// Quota reset day (alias for quota_reset_day)
+    /// 每月配额重置日（1-28），唯一字段；旧键 "quota_reset_day" 读取时兼容映射到此
     reset_day: u8 = 1,
 };
 
@@ -84,7 +82,6 @@ pub const ConfigSource = struct {
     quota_limit_bytes: bool = false,
     quota_warning_threshold: bool = false,
     quota_disconnect_threshold: bool = false,
-    quota_reset_day: bool = false,
     webhook_url: bool = false,
     smtp_server: bool = false,
     smtp_port: bool = false,
@@ -258,11 +255,14 @@ pub fn parseConfigJson(allocator: Allocator, json_content: []const u8) !ParseRes
             config.quota_disconnect_threshold = val;
             source.quota_disconnect_threshold = true;
         } else if (std.mem.eql(u8, key, "quota_reset_day")) {
-            if (value != .integer) return error.InvalidFieldType;
-            const val = value.integer;
-            if (val < 1 or val > 28) return error.ValueOutOfRange;
-            config.quota_reset_day = @intCast(val);
-            source.quota_reset_day = true;
+            // 旧键兼容：仅当 reset_day 尚未显式出现时写入，显式 reset_day 永远优先
+            if (!source.reset_day) {
+                if (value != .integer) return error.InvalidFieldType;
+                const val = value.integer;
+                if (val < 1 or val > 28) return error.ValueOutOfRange;
+                config.reset_day = @intCast(val);
+                source.reset_day = true;
+            }
         } else if (std.mem.eql(u8, key, "reset_day")) {
             if (value != .integer) return error.InvalidFieldType;
             const val = value.integer;
@@ -403,9 +403,6 @@ pub fn mergeConfigs(
     if (cli_source.quota_disconnect_threshold) {
         result.quota_disconnect_threshold = cli_config.quota_disconnect_threshold;
     }
-    if (cli_source.quota_reset_day) {
-        result.quota_reset_day = cli_config.quota_reset_day;
-    }
     if (cli_source.reset_day) {
         result.reset_day = cli_config.reset_day;
     }
@@ -483,19 +480,19 @@ pub fn defaultConfigPath(allocator: Allocator, home_dir: ?[]const u8) ![]const u
 
 /// Get sample configuration JSON
 pub fn sampleConfig() []const u8 {
-    return 
-        \\{
-        \\    "interface": null,
-        \\    "interval_sec": 1,
-        \\    "daemon_mode": false,
-        \\    "foreground": false,
-        \\    "use_sqlite": false,
-        \\    "retention_days": 30,
-        \\    "log_file": null,
-        \\    "pid_file": null,
-        \\    "list_only": false,
-        \\    "day_count": 0
-        \\}
+    return
+    \\{
+    \\    "interface": null,
+    \\    "interval_sec": 1,
+    \\    "daemon_mode": false,
+    \\    "foreground": false,
+    \\    "use_sqlite": false,
+    \\    "retention_days": 30,
+    \\    "log_file": null,
+    \\    "pid_file": null,
+    \\    "list_only": false,
+    \\    "day_count": 0
+    \\}
     ;
 }
 
@@ -677,22 +674,37 @@ test "parse reset_day field" {
 
     try std.testing.expectEqual(@as(u8, 15), result.config.reset_day);
     try std.testing.expect(result.source.reset_day);
-    // quota_reset_day should remain at default
-    try std.testing.expectEqual(@as(u8, 1), result.config.quota_reset_day);
-    try std.testing.expect(!result.source.quota_reset_day);
 }
 
-test "parse quota_reset_day field" {
+test "parse legacy quota_reset_day key maps to reset_day" {
     const allocator = std.testing.allocator;
     const json = "{\"quota_reset_day\": 20}";
     const result = try parseConfigJson(allocator, json);
     defer deinitConfig(allocator, &result.config);
 
-    try std.testing.expectEqual(@as(u8, 20), result.config.quota_reset_day);
-    try std.testing.expect(result.source.quota_reset_day);
-    // reset_day should remain at default
-    try std.testing.expectEqual(@as(u8, 1), result.config.reset_day);
-    try std.testing.expect(!result.source.reset_day);
+    // 旧键映射到 reset_day 并置位来源标记
+    try std.testing.expectEqual(@as(u8, 20), result.config.reset_day);
+    try std.testing.expect(result.source.reset_day);
+}
+
+test "explicit reset_day wins over legacy quota_reset_day" {
+    const allocator = std.testing.allocator;
+
+    // 键顺序：reset_day 在前
+    {
+        const json = "{\"reset_day\": 10, \"quota_reset_day\": 20}";
+        const result = try parseConfigJson(allocator, json);
+        defer deinitConfig(allocator, &result.config);
+        try std.testing.expectEqual(@as(u8, 10), result.config.reset_day);
+    }
+
+    // 键顺序：quota_reset_day 在前
+    {
+        const json = "{\"quota_reset_day\": 20, \"reset_day\": 10}";
+        const result = try parseConfigJson(allocator, json);
+        defer deinitConfig(allocator, &result.config);
+        try std.testing.expectEqual(@as(u8, 10), result.config.reset_day);
+    }
 }
 
 test "reset_day out of range rejected" {

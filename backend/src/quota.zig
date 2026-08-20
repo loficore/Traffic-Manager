@@ -89,15 +89,17 @@ fn unitToMultiplier(unit: []const u8) ?u64 {
     return null;
 }
 
-/// Query the monthly traffic total (rx + tx bytes) from the SQLite daily_traffic table.
-/// first_day_of_month is the epoch day number for the first day of the target month.
-/// Returns 0 if no data found.
-pub fn getMonthlyTraffic(conn: *zqlite.Conn, first_day_of_month: i64) QuotaError!u64 {
+/// 查询预算周期内的流量总量（rx + tx 字节）自 SQLite daily_traffic 表。
+/// period_start_epoch_day 为周期起始日的 epoch day 号（语义从「自然月 1 号」变为
+/// 「滚动窗口周期起始日」，由 computePeriod 计算）。daily_traffic 只记录到「今天」、
+/// 无未来数据，故 `WHERE date >= ?1` 即等价于「周期内总流量」，无需上界。
+/// 返回 0 若无数据。
+pub fn getMonthlyTraffic(conn: *zqlite.Conn, period_start_epoch_day: i64) QuotaError!u64 {
     const row = conn.row(
         \\SELECT COALESCE(SUM(total_rx_bytes + total_tx_bytes), 0)
         \\FROM daily_traffic
         \\WHERE date >= ?1
-    , .{first_day_of_month}) catch return QuotaError.QueryFailed;
+    , .{period_start_epoch_day}) catch return QuotaError.QueryFailed;
     if (row) |r| {
         defer r.deinit();
         return @intCast(r.int(0));
@@ -148,6 +150,43 @@ pub fn firstDayOfMonthEpochDay(year: u32, month: u32) u32 {
     return total_days;
 }
 
+/// 预算周期信息：滚动窗口的起始日与起始日所在自然月。
+pub const PeriodInfo = struct {
+    /// 周期起始日的 epoch day 号
+    start_epoch_day: u32,
+    /// 周期起始日所在自然年（用于 month_key）
+    year: u32,
+    /// 周期起始日所在自然月（用于 month_key）
+    month: u32,
+};
+
+/// 计算滚动预算周期的起始日：重置日到下一个重置日前一天为一个周期（周期起始用量归零）。
+/// day >= reset_day → 周期起始于本月 reset_day 号；day < reset_day → 回退到上月 reset_day 号。
+pub fn computePeriod(reset_day: u8, year: u32, month: u32, day: u32) PeriodInfo {
+    var period_year = year;
+    var period_month = month;
+
+    // day 未到重置日，周期起始于上月 reset_day 号
+    if (day < reset_day) {
+        // u32 无符号运算：month==1 时回退到上年 12 月，避免 month-1 下溢为 0
+        if (month == 1) {
+            period_year = year - 1;
+            period_month = 12;
+        } else {
+            period_month = month - 1;
+        }
+    }
+
+    // 周期起始 epoch day = 起始月 1 号 + (reset_day - 1)
+    const start_epoch_day = firstDayOfMonthEpochDay(period_year, period_month) + @as(u32, reset_day) - 1;
+
+    return .{
+        .start_epoch_day = start_epoch_day,
+        .year = period_year,
+        .month = period_month,
+    };
+}
+
 /// Get current day of month (1-31) from epoch seconds.
 pub fn getDayOfMonth(epoch_secs: u64) u8 {
     const es = std.time.epoch.EpochSeconds{ .secs = epoch_secs };
@@ -177,6 +216,130 @@ pub fn resetQuotaState(allocator: Allocator) void {
 
 fn isLeapYear(year: u32) bool {
     return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0);
+}
+
+// ── 配额调整 CRUD ──
+
+/// 配额调整记录：对月度配额的手动增减
+pub const QuotaAdjustment = struct {
+    /// 自增主键 ID
+    id: i64,
+    /// 调整字节数（正数增加配额，负数减少配额）
+    amount_bytes: u64,
+    /// 调整原因描述
+    reason: []const u8,
+    /// 调整来源（如 "manual"、"api"）
+    source: []const u8,
+    /// 月份键，格式 "YYYY-MM"（如 "2026-08"）
+    month_key: []const u8,
+    /// 创建时间（epoch 毫秒）
+    created_at: i64,
+};
+
+/// 添加配额调整记录，返回含自增 id 的完整记录
+pub fn addAdjustment(
+    _: Allocator,
+    conn: *zqlite.Conn,
+    amount_bytes: u64,
+    reason: []const u8,
+    source: []const u8,
+    month_key: []const u8,
+    created_at: i64,
+) QuotaError!QuotaAdjustment {
+    conn.exec(
+        \\INSERT INTO quota_adjustments (amount_bytes, reason, source, month_key, created_at)
+        \\VALUES (?1, ?2, ?3, ?4, ?5)
+    , .{
+        @as(i64, @bitCast(amount_bytes)),
+        reason,
+        source,
+        month_key,
+        created_at,
+    }) catch return QuotaError.QueryFailed;
+
+    // 获取刚插入的记录 id
+    const row = conn.row(
+        "SELECT last_insert_rowid()",
+        .{},
+    ) catch return QuotaError.QueryFailed;
+    const id: i64 = if (row) |r| blk: {
+        defer r.deinit();
+        break :blk r.int(0);
+    } else 0;
+
+    return .{
+        .id = id,
+        .amount_bytes = amount_bytes,
+        .reason = reason,
+        .source = source,
+        .month_key = month_key,
+        .created_at = created_at,
+    };
+}
+
+/// 删除指定 id 的配额调整记录
+pub fn removeAdjustment(conn: *zqlite.Conn, id: i64) QuotaError!void {
+    conn.exec(
+        "DELETE FROM quota_adjustments WHERE id = ?1",
+        .{id},
+    ) catch return QuotaError.QueryFailed;
+}
+
+/// 列出指定月份的所有配额调整记录
+pub fn listAdjustments(
+    allocator: Allocator,
+    conn: *zqlite.Conn,
+    month_key: []const u8,
+) QuotaError![]QuotaAdjustment {
+    var result_list: std.ArrayList(QuotaAdjustment) = .empty;
+    errdefer result_list.deinit(allocator);
+
+    var rows = conn.rows(
+        "SELECT id, amount_bytes, reason, source, month_key, created_at FROM quota_adjustments WHERE month_key = ?1 ORDER BY created_at",
+        .{month_key},
+    ) catch return QuotaError.QueryFailed;
+    defer rows.deinit();
+
+    while (rows.next()) |row| {
+        const reason_text = row.text(2);
+        const source_text = row.text(3);
+        const mk_text = row.text(4);
+
+        result_list.append(allocator, .{
+            .id = row.int(0),
+            .amount_bytes = @bitCast(row.int(1)),
+            .reason = try allocator.dupe(u8, reason_text),
+            .source = try allocator.dupe(u8, source_text),
+            .month_key = try allocator.dupe(u8, mk_text),
+            .created_at = row.int(5),
+        }) catch return QuotaError.OutOfMemory;
+    }
+    if (rows.err) |_| return QuotaError.QueryFailed;
+
+    return result_list.toOwnedSlice(allocator) catch return QuotaError.OutOfMemory;
+}
+
+/// 获取指定月份所有调整的字节总和（正数相加，负数相减）
+pub fn getAdjustmentTotal(conn: *zqlite.Conn, month_key: []const u8) QuotaError!u64 {
+    const row = conn.row(
+        "SELECT COALESCE(SUM(amount_bytes), 0) FROM quota_adjustments WHERE month_key = ?1",
+        .{month_key},
+    ) catch return QuotaError.QueryFailed;
+    if (row) |r| {
+        defer r.deinit();
+        return @intCast(r.int(0));
+    }
+    return 0;
+}
+
+/// 获取当月有效配额 = 基础配额 + 当月所有调整之和
+pub fn getEffectiveMonthlyQuota(
+    conn: *zqlite.Conn,
+    limit_bytes: u64,
+    month_key: []const u8,
+) QuotaError!u64 {
+    const adjustment_total = try getAdjustmentTotal(conn, month_key);
+    return std.math.add(u64, limit_bytes, adjustment_total) catch 0;
 }
 
 // =============================================================================
@@ -314,4 +477,52 @@ test "getDayOfMonth: returns correct day" {
     // 2024-01-15 12:00:00 UTC
     const epoch_secs: u64 = 1705320000;
     try std.testing.expectEqual(@as(u8, 15), getDayOfMonth(epoch_secs));
+}
+
+test "computePeriod: day >= reset_day → this month" {
+    // reset_day=15，2026-08-20 >= 15 → 周期起始于本月 2026-08-15
+    const period = computePeriod(15, 2026, 8, 20);
+    try std.testing.expectEqual(firstDayOfMonthEpochDay(2026, 8) + 14, period.start_epoch_day);
+    try std.testing.expectEqual(@as(u32, 2026), period.year);
+    try std.testing.expectEqual(@as(u32, 8), period.month);
+}
+
+test "computePeriod: day < reset_day → last month" {
+    // reset_day=15，2026-08-10 < 15 → 回退到上月周期起始 2026-07-15
+    const period = computePeriod(15, 2026, 8, 10);
+    try std.testing.expectEqual(firstDayOfMonthEpochDay(2026, 7) + 14, period.start_epoch_day);
+    try std.testing.expectEqual(@as(u32, 2026), period.year);
+    try std.testing.expectEqual(@as(u32, 7), period.month);
+}
+
+test "computePeriod: January rollback" {
+    // reset_day=5，2026-01-03 < 5 且 month==1 → 跨年回退到上年 12 月周期起始 2025-12-05
+    const period = computePeriod(5, 2026, 1, 3);
+    try std.testing.expectEqual(firstDayOfMonthEpochDay(2025, 12) + 4, period.start_epoch_day);
+    try std.testing.expectEqual(@as(u32, 2025), period.year);
+    try std.testing.expectEqual(@as(u32, 12), period.month);
+}
+
+test "computePeriod: day == reset_day → this month" {
+    // 边界：day 恰好等于 reset_day，归属本月周期（不是回退）
+    const period = computePeriod(15, 2026, 8, 15);
+    try std.testing.expectEqual(firstDayOfMonthEpochDay(2026, 8) + 14, period.start_epoch_day);
+    try std.testing.expectEqual(@as(u32, 2026), period.year);
+    try std.testing.expectEqual(@as(u32, 8), period.month);
+}
+
+test "computePeriod: reset_day=1 degenerates to natural month" {
+    // reset_day=1 时周期起始即自然月 1 号（退化情形）
+    const period = computePeriod(1, 2026, 8, 20);
+    try std.testing.expectEqual(firstDayOfMonthEpochDay(2026, 8), period.start_epoch_day);
+    try std.testing.expectEqual(@as(u32, 2026), period.year);
+    try std.testing.expectEqual(@as(u32, 8), period.month);
+}
+
+test "computePeriod: February cross-month" {
+    // reset_day=28，2026-03-01 < 28 → 回退到 2 月末周期起始 2026-02-28
+    const period = computePeriod(28, 2026, 3, 1);
+    try std.testing.expectEqual(firstDayOfMonthEpochDay(2026, 2) + 27, period.start_epoch_day);
+    try std.testing.expectEqual(@as(u32, 2026), period.year);
+    try std.testing.expectEqual(@as(u32, 2), period.month);
 }

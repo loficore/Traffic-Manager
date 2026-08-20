@@ -19,6 +19,8 @@ pub const smtp = @import("smtp.zig");
 pub const cfg = @import("config.zig");
 pub const notify_template = @import("notify_template.zig");
 pub const quota = @import("quota.zig");
+pub const config_store = @import("config_store.zig");
+pub const http_server = @import("http_server.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -26,6 +28,14 @@ const Allocator = std.mem.Allocator;
 const StorageBackend = union(enum) {
     file: *storage.Storage,
     sqlite: *sqlite_storage.SQLiteStorage,
+};
+
+/// 命令行指定的临时配额调整参数
+pub const QuotaAdjustmentArg = struct {
+    /// 调整额度（字节）
+    amount_bytes: u64,
+    /// 调整原因（未提供时为空字符串）
+    reason: []const u8,
 };
 
 pub const AppConfig = struct {
@@ -58,8 +68,6 @@ pub const AppConfig = struct {
     quota_warning_threshold: f64 = 0.9,
     /// 断网阈值（占配额比例，如 1.0 = 100%）
     quota_disconnect_threshold: f64 = 1.0,
-    /// 每月配额重置日期（1-28）
-    quota_reset_day: u8 = 1,
     // ── 通知配置 ──
     /// Webhook URL（用于 HTTP POST 通知）
     webhook_url: ?[]const u8 = null,
@@ -80,9 +88,21 @@ pub const AppConfig = struct {
     restore_network: bool = false,
     /// 配额重置日（1-28），用于自动恢复判断
     reset_day: u8 = 1,
+    /// CLI 指定的临时配额调整（仅命令行生效，不参与配置合并，也不存入 ConfigStore）
+    quota_adjustments: []QuotaAdjustmentArg = &.{},
+    /// HTTP 服务器端口（0 = 不启动 HTTP 服务器）
+    web_port: u16 = 0,
 };
 
-pub fn parseArgs(io: std.Io, allocator: Allocator, args_vec: std.process.Args) !AppConfig {
+/// parseArgs 返回结果，包含合并后的配置和 CLI 来源信息
+/// 用于 runDemo 中 SQLite ConfigStore 加载后重新合并 CLI 覆盖
+pub const ParseResult = struct {
+    config: AppConfig,
+    cli_source: cfg.ConfigSource,
+    cli_cfg: cfg.Config,
+};
+
+pub fn parseArgs(io: std.Io, allocator: Allocator, args_vec: std.process.Args) !ParseResult {
     var args = try std.process.Args.Iterator.initAllocator(args_vec, allocator);
     defer args.deinit();
 
@@ -122,6 +142,12 @@ pub fn parseArgs(io: std.Io, allocator: Allocator, args_vec: std.process.Args) !
     // Second pass: parse CLI arguments
     var cli_config = AppConfig{};
     var cli_source = cfg.ConfigSource{};
+
+    // 待处理的配额调整参数（--quota-adjust 与 --quota-adjust-reason 配对使用）
+    var pending_adjust_amount: ?[]const u8 = null;
+    var pending_adjust_reason: ?[]const u8 = null;
+    // 收集所有 CLI 指定的配额调整
+    var adjust_list = std.ArrayList(QuotaAdjustmentArg).empty;
 
     while (args.next()) |arg| {
         // 配置文件路径（已在第一轮处理，这里跳过值）
@@ -212,8 +238,7 @@ pub fn parseArgs(io: std.Io, allocator: Allocator, args_vec: std.process.Args) !
         else if (std.mem.eql(u8, arg, "--sqlite")) {
             cli_config.use_sqlite = true;
             cli_source.use_sqlite = true;
-        }
-        else if (std.mem.eql(u8, arg, "--no-sqlite")) {
+        } else if (std.mem.eql(u8, arg, "--no-sqlite")) {
             cli_config.use_sqlite = false;
             cli_source.use_sqlite = true;
         }
@@ -328,6 +353,40 @@ pub fn parseArgs(io: std.Io, allocator: Allocator, args_vec: std.process.Args) !
             cli_config.smtp_to = try allocator.dupe(u8, val_str);
             cli_source.smtp_to = true;
         }
+        // 临时配额调整（可多次指定，每次添加一条调整记录）
+        else if (std.mem.eql(u8, arg, "--quota-adjust")) {
+            const val_str = args.next() orelse {
+                std.debug.print("错误: --quota-adjust 选项缺少参数值\n", .{});
+                return error.MissingArgumentValue;
+            };
+            // 固化上一个待定调整，保证原因（--quota-adjust-reason）若出现在其前也能正确配对
+            if (pending_adjust_amount) |prev_str| {
+                const prev_amount = quota.parseTrafficUnit(prev_str) catch |err| {
+                    std.debug.print("错误: --quota-adjust 参数值 '{s}' 无效 ({s})\n", .{ prev_str, @errorName(err) });
+                    allocator.free(prev_str);
+                    return error.InvalidArgumentValue;
+                };
+                allocator.free(prev_str);
+                try adjust_list.append(allocator, .{
+                    .amount_bytes = prev_amount,
+                    .reason = pending_adjust_reason orelse "",
+                });
+                // 原因指针已移交给记录（runDemo 统一释放），此处只清空挂起状态
+                pending_adjust_amount = null;
+                pending_adjust_reason = null;
+            }
+            pending_adjust_amount = try allocator.dupe(u8, val_str);
+        }
+        // 配额调整原因（与最近一次的 --quota-adjust 配对，可出现在其前或后）
+        else if (std.mem.eql(u8, arg, "--quota-adjust-reason")) {
+            const val_str = args.next() orelse {
+                std.debug.print("错误: --quota-adjust-reason 选项缺少参数值\n", .{});
+                return error.MissingArgumentValue;
+            };
+            // 覆盖旧原因前先释放，避免内存泄漏
+            if (pending_adjust_reason) |old| allocator.free(old);
+            pending_adjust_reason = try allocator.dupe(u8, val_str);
+        }
         // 手动恢复网络并重置配额
         else if (std.mem.eql(u8, arg, "--resume")) {
             cli_config.restore_network = true;
@@ -345,12 +404,48 @@ pub fn parseArgs(io: std.Io, allocator: Allocator, args_vec: std.process.Args) !
             };
             cli_source.reset_day = true;
         }
+        // HTTP 服务器端口
+        else if (std.mem.eql(u8, arg, "--web-port")) {
+            const val_str = args.next() orelse {
+                std.debug.print("错误: --web-port 选项缺少参数值\n", .{});
+                return error.MissingArgumentValue;
+            };
+            cli_config.web_port = std.fmt.parseInt(u16, val_str, 10) catch {
+                std.debug.print("错误: --web-port 参数值 '{s}' 不是有效数字!\n", .{val_str});
+                return error.InvalidArgumentValue;
+            };
+        }
         // 帮助
         else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             printHelp();
             std.process.exit(0);
         }
+
     }
+
+    // 循环结束后固化仍挂起的最后一个配额调整
+    if (pending_adjust_amount) |amt_str| {
+        const amount = quota.parseTrafficUnit(amt_str) catch |err| {
+            std.debug.print("错误: --quota-adjust 参数值 '{s}' 无效 ({s})\n", .{ amt_str, @errorName(err) });
+            allocator.free(amt_str);
+            return error.InvalidArgumentValue;
+        };
+        allocator.free(amt_str);
+        try adjust_list.append(allocator, .{
+            .amount_bytes = amount,
+            .reason = pending_adjust_reason orelse "",
+        });
+        // 原因指针已移交给记录（runDemo 统一释放），此处只清空挂起状态
+        pending_adjust_amount = null;
+        pending_adjust_reason = null;
+    } else if (pending_adjust_reason) |r| {
+        // 只给了原因却没有对应的调整量，释放遗留原因避免泄漏
+        allocator.free(r);
+        pending_adjust_reason = null;
+    }
+
+    // 将收集到的 CLI 配额调整挂到 CLI 配置上（非 cfg.Config 字段，仅 CLI 生效）
+    cli_config.quota_adjustments = try adjust_list.toOwnedSlice(allocator);
 
     // Merge configs: CLI takes precedence over file
     // Convert cli_config to cfg.Config for merging
@@ -368,7 +463,6 @@ pub fn parseArgs(io: std.Io, allocator: Allocator, args_vec: std.process.Args) !
         .quota_limit_bytes = cli_config.quota_limit_bytes,
         .quota_warning_threshold = cli_config.quota_warning_threshold,
         .quota_disconnect_threshold = cli_config.quota_disconnect_threshold,
-        .quota_reset_day = cli_config.quota_reset_day,
         .reset_day = cli_config.reset_day,
         .webhook_url = cli_config.webhook_url,
         .smtp_server = cli_config.smtp_server,
@@ -398,7 +492,6 @@ pub fn parseArgs(io: std.Io, allocator: Allocator, args_vec: std.process.Args) !
         .quota_limit_bytes = merged.quota_limit_bytes,
         .quota_warning_threshold = merged.quota_warning_threshold,
         .quota_disconnect_threshold = merged.quota_disconnect_threshold,
-        .quota_reset_day = merged.quota_reset_day,
         // 通知配置
         .webhook_url = merged.webhook_url,
         .smtp_server = merged.smtp_server,
@@ -410,6 +503,9 @@ pub fn parseArgs(io: std.Io, allocator: Allocator, args_vec: std.process.Args) !
         // 运行时控制
         .restore_network = merged.restore_network,
         .reset_day = merged.reset_day,
+        // CLI 配额调整（不参与配置合并，直接透传）
+        .quota_adjustments = cli_config.quota_adjustments,
+        .web_port = cli_config.web_port,
     };
 
     // Validate
@@ -430,7 +526,11 @@ pub fn parseArgs(io: std.Io, allocator: Allocator, args_vec: std.process.Args) !
         return error.InvalidArgumentValue;
     }
 
-    return result;
+    return .{
+        .config = result,
+        .cli_source = cli_source,
+        .cli_cfg = cli_cfg_config,
+    };
 }
 
 fn printHelp() void {
@@ -465,6 +565,9 @@ fn printHelp() void {
         \\  --quota-reset-day <日期>   配额每月重置日（1-28，默认: 1）
         \\  --resume                   手动恢复网络并重置配额状态
         \\  --reset-day <日期>         配额每月重置日（1-28，默认: 1）
+        \\  --quota-adjust <金额>      添加当月临时配额（可多次指定，支持: 500MB, 1GB）
+        \\  --quota-adjust-reason <文本>  配额调整原因（配合 --quota-adjust 使用）
+        \\                               - 与最近一次的 --quota-adjust 配对
         \\
         \\通知配置选项:
         \\  --webhook-url <URL>        Webhook 通知地址
@@ -520,7 +623,10 @@ pub fn main(init: std.process.Init) !void {
     const home_dir = init.environ_map.get("HOME");
 
     // 先解析参数，以便判断是否需要 daemonize
-    var app_config = try parseArgs(init.io, init.gpa, init.minimal.args);
+    const parse_result = try parseArgs(init.io, init.gpa, init.minimal.args);
+    var app_config = parse_result.config;
+    const cli_source = parse_result.cli_source;
+    const cli_cfg = parse_result.cli_cfg;
     defer if (app_config.interface) |iface| init.gpa.free(iface);
     defer if (app_config.log_file) |path| init.gpa.free(path);
     defer if (app_config.pid_file) |path| init.gpa.free(path);
@@ -551,7 +657,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    try runDemo(io, init.gpa, &app_config, home_dir);
+    try runDemo(io, init.gpa, &app_config, cli_source, cli_cfg, home_dir);
 }
 
 /// Handle --resume command: restore network interface and reset quota state
@@ -559,9 +665,9 @@ fn handleResume(io: std.Io, allocator: Allocator, config: *AppConfig) !void {
     // Get current time for logging
     const now_ms = std.Io.Timestamp.now(io, .real).nanoseconds;
     const now_secs: u64 = @intCast(@divTrunc(now_ms, std.time.ns_per_s));
-    
+
     try printOut(io, "\n============ 恢复网络配额 ============\n", .{});
-    
+
     // Determine which interface to restore
     const iface = if (config.interface) |name|
         try allocator.dupe(u8, name)
@@ -571,10 +677,10 @@ fn handleResume(io: std.Io, allocator: Allocator, config: *AppConfig) !void {
             return err;
         };
     defer allocator.free(iface);
-    
+
     // Check current interface status
     const is_up = if (network.queryInterfaceStatus(iface)) |up| up else |_| false;
-    
+
     if (is_up) {
         try printOut(io, "接口 {s} 已经是 UP 状态，无需恢复\n", .{iface});
     } else {
@@ -585,11 +691,11 @@ fn handleResume(io: std.Io, allocator: Allocator, config: *AppConfig) !void {
         };
         try printOut(io, "✓ 接口 {s} 已恢复 (UP)\n", .{iface});
     }
-    
+
     // Reset quota state
     quota.resetQuotaState(allocator);
     try printOut(io, "✓ 配额状态已重置\n", .{});
-    
+
     // Log the restore event
     var time_buf: [20]u8 = undefined;
     const timestamp = formatTimestampFull(&time_buf, now_secs);
@@ -622,23 +728,23 @@ fn installSignalHandlers() void {
     posix.sigaction(.TERM, &act, null);
 }
 
-fn runDemo(io: std.Io, allocator: Allocator, config: *AppConfig, home_dir: ?[]const u8) !void {
+fn runDemo(io: std.Io, allocator: Allocator, config: *AppConfig, cli_source: cfg.ConfigSource, cli_cfg: cfg.Config, home_dir: ?[]const u8) !void {
     // Handle --resume command first
     if (config.restore_network) {
         try handleResume(io, allocator, config);
         return;
     }
-    
+
     // Check for auto-restore on startup (monthly reset day)
     const now_ms = std.Io.Timestamp.now(io, .real).nanoseconds;
     const now_secs: u64 = @intCast(@divTrunc(now_ms, std.time.ns_per_s));
-    
+
     if (quota.shouldRestore(config.reset_day, now_secs)) {
         try printOut(io, "\n[自动恢复] 检测到今日是配额重置日 (第 {d} 天)\n", .{config.reset_day});
         try handleResume(io, allocator, config);
         return;
     }
-    
+
     if (config.list_only) {
         try printInterfaceList(io, allocator);
         return;
@@ -683,6 +789,13 @@ fn runDemo(io: std.Io, allocator: Allocator, config: *AppConfig, home_dir: ?[]co
         }
     }
 
+    // HTTP 服务器依赖 SQLite（共享 zqlite 连接、读取配置/配额/历史数据），
+    // 非 SQLite 模式请求 --web-port 时明确拒绝启动，避免静默不可用。
+    if (config.web_port > 0 and !config.use_sqlite) {
+        std.debug.print("错误: --web-port 需要 SQLite 存储模式（请加 --sqlite 选项）\n", .{});
+        return error.WebRequiresSqlite;
+    }
+
     if (config.use_sqlite) {
         // SQLite 存储模式
         const db_path = sqlite_storage.defaultDbPath(allocator, home_dir) catch |err| {
@@ -700,9 +813,88 @@ fn runDemo(io: std.Io, allocator: Allocator, config: *AppConfig, home_dir: ?[]co
             sqlite_stor.deinit();
         }
 
+        // ── ConfigStore: 从 SQLite 加载配置 ──
+        const store = config_store.ConfigStore.init(&sqlite_stor.conn, allocator);
+
+        // 首次运行时自动迁移 JSON 配置到 SQLite
+        store.migrateFromJson(io, home_dir);
+
+        // 从 SQLite 加载配置，与 CLI 参数重新合并
+        if (store.loadAll()) |db_config| {
+            // 使用 SQLite 存储的配置作为基础，CLI 参数覆盖
+            const remerged = cfg.mergeConfigs(db_config, cli_cfg, cli_source);
+            // 更新 AppConfig 中非 CLI 指定的字段
+            if (!cli_source.interval_sec) config.interval_sec = remerged.interval_sec;
+            if (!cli_source.interface) config.interface = remerged.interface;
+            if (!cli_source.daemon_mode) config.daemon_mode = remerged.daemon_mode;
+            if (!cli_source.foreground) config.foreground = remerged.foreground;
+            if (!cli_source.use_sqlite) config.use_sqlite = remerged.use_sqlite;
+            if (!cli_source.retention_days) config.retention_days = remerged.retention_days;
+            if (!cli_source.log_file) config.log_file = remerged.log_file;
+            if (!cli_source.pid_file) config.pid_file = remerged.pid_file;
+            if (!cli_source.list_only) config.list_only = remerged.list_only;
+            if (!cli_source.day_count) config.day_count = remerged.day_count;
+            if (!cli_source.quota_limit_bytes) config.quota_limit_bytes = remerged.quota_limit_bytes;
+            if (!cli_source.quota_warning_threshold) config.quota_warning_threshold = remerged.quota_warning_threshold;
+            if (!cli_source.quota_disconnect_threshold) config.quota_disconnect_threshold = remerged.quota_disconnect_threshold;
+            if (!cli_source.reset_day) config.reset_day = remerged.reset_day;
+            if (!cli_source.webhook_url) config.webhook_url = remerged.webhook_url;
+            if (!cli_source.smtp_server) config.smtp_server = remerged.smtp_server;
+            if (!cli_source.smtp_port) config.smtp_port = remerged.smtp_port;
+            if (!cli_source.smtp_user) config.smtp_user = remerged.smtp_user;
+            if (!cli_source.smtp_pass) config.smtp_pass = remerged.smtp_pass;
+            if (!cli_source.smtp_from) config.smtp_from = remerged.smtp_from;
+            if (!cli_source.smtp_to) config.smtp_to = remerged.smtp_to;
+            if (!cli_source.restore_network) config.restore_network = remerged.restore_network;
+            log.info("配置来源: SQLite", .{});
+        } else |_| {
+            log.info("配置来源: 默认值（SQLite 配置表为空）", .{});
+        }
+
+        // 处理 CLI 指定的临时配额调整（将每条记录写入预算周期调整表）
+        if (config.quota_adjustments.len > 0) {
+            // 用当前日期计算滚动预算周期（重置日语义），月份键取周期起始月
+            const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = now_secs };
+            const epoch_day = epoch_seconds.getEpochDay();
+            const year_day = epoch_day.calculateYearDay();
+            const month_day = year_day.calculateMonthDay();
+            const period = quota.computePeriod(config.reset_day, year_day.year, month_day.month.numeric(), month_day.day_index + 1);
+
+            var adj_buf: [16]u8 = undefined;
+            const adj_month_key = periodMonthKey(&period, &adj_buf);
+            if (adj_month_key) |month_key| {
+                const created_at: i64 = @intCast(@divTrunc(now_ms, std.time.ns_per_ms));
+                for (config.quota_adjustments) |adj| {
+                    _ = quota.addAdjustment(allocator, &sqlite_stor.conn, adj.amount_bytes, adj.reason, "cli", month_key, created_at) catch |err| {
+                        log.warn("添加配额调整失败: {s}", .{@errorName(err)});
+                    };
+                }
+            } else {
+                log.warn("月份键生成失败，跳过配额调整", .{});
+            }
+
+            // 释放配额调整参数占用的内存
+            for (config.quota_adjustments) |adj| {
+                if (adj.reason.len > 0) allocator.free(adj.reason);
+            }
+            allocator.free(config.quota_adjustments);
+            config.quota_adjustments = &.{};
+        }
+
         try runLiveMonitorSqlite(io, allocator, config.*, &sqlite_stor);
     } else {
         // 二进制文件存储模式
+        // 配额调整仅支持 SQLite 模式，二进制模式下仅告警不报错
+        if (config.quota_adjustments.len > 0) {
+            // 前台无 --log-file 时 log.warn 静默，故额外用 stderr 打印可见警告
+            std.debug.print("警告: --quota-adjust 仅在 SQLite 模式下生效，已忽略 {d} 条配额调整\n", .{config.quota_adjustments.len});
+            log.warn("--quota-adjust 仅在 SQLite 模式下生效，已忽略 {d} 条配额调整", .{config.quota_adjustments.len});
+            for (config.quota_adjustments) |adj| {
+                if (adj.reason.len > 0) allocator.free(adj.reason);
+            }
+            allocator.free(config.quota_adjustments);
+            config.quota_adjustments = &.{};
+        }
         const state_path = storage.defaultStateFilePath(allocator, home_dir) catch |err| {
             std.debug.print("警告: 无法确定状态文件路径 ({s})，历史记录功能已禁用\n", .{@errorName(err)});
             return runLiveMonitorFile(io, allocator, config.*, null);
@@ -720,6 +912,12 @@ fn runDemo(io: std.Io, allocator: Allocator, config: *AppConfig, home_dir: ?[]co
 
         try runLiveMonitorFile(io, allocator, config.*, &stor);
     }
+}
+
+/// 生成预算周期月份键（YYYY-MM），语义为周期起始月（见 quota.computePeriod）。
+/// 返回 null 表示缓冲不足（正常 [16]u8 不会发生）。
+fn periodMonthKey(period: *const quota.PeriodInfo, buf: []u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}", .{ period.year, period.month }) catch null;
 }
 
 fn runLiveMonitorFile(io: std.Io, allocator: Allocator, config: AppConfig, stor: ?*storage.Storage) !void {
@@ -836,7 +1034,7 @@ fn runLiveMonitorSqlite(io: std.Io, allocator: Allocator, config: AppConfig, sto
             formatBytes(&rx_total_buf, config.quota_limit_bytes, ""),
             config.quota_warning_threshold * 100,
             config.quota_disconnect_threshold * 100,
-            config.quota_reset_day,
+            config.reset_day,
         });
     }
     if (config.webhook_url) |url| {
@@ -848,6 +1046,35 @@ fn runLiveMonitorSqlite(io: std.Io, allocator: Allocator, config: AppConfig, sto
     try printOut(io, "--------------------------------------------------------------\n", .{});
     try printOut(io, "  时间          ↓ 下行速率      ↑ 上行速率      ↓ PPS    ↑ PPS    累计下行        累计上行\n", .{});
     try printOut(io, "--------------------------------------------------------------\n", .{});
+
+    // ── 启动 HTTP 服务器（如果配置了端口） ──
+    var app_state = http_server.AppState{};
+    var http_thread: ?std.Thread = null;
+    if (config.web_port > 0) {
+        app_state.config = .{
+            .interval_sec = config.interval_sec,
+            .retention_days = config.retention_days,
+            .quota_limit_bytes = config.quota_limit_bytes,
+            .quota_warning_threshold = config.quota_warning_threshold,
+            .quota_disconnect_threshold = config.quota_disconnect_threshold,
+            .reset_day = config.reset_day,
+        };
+        app_state.iface = iface;
+        app_state.start_time_secs = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
+
+        const ctx = http_server.HttpServerContext{
+            .allocator = allocator,
+            .state = &app_state,
+            .conn = &stor.conn,
+            .io = io,
+            .port = config.web_port,
+        };
+        http_thread = http_server.startHttpServer(ctx) catch |err| blk: {
+            std.debug.print("错误: HTTP 服务器启动失败（端口 {d} 可能被占用或不可用，错误: {s}），Web 仪表盘不可用\n", .{ config.web_port, @errorName(err) });
+            break :blk null;
+        };
+        try printOut(io, "  HTTP 服务器: http://localhost:{d}/\n", .{config.web_port});
+    }
 
     var time_buf: [16]u8 = undefined;
     var rx_speed_buf: [24]u8 = undefined;
@@ -879,26 +1106,41 @@ fn runLiveMonitorSqlite(io: std.Io, allocator: Allocator, config: AppConfig, sto
         if (config.quota_limit_bytes > 0 and stats.timestamp_ms - last_quota_check_ms >= quota_check_interval_ms) {
             last_quota_check_ms = stats.timestamp_ms;
 
-            // 计算当月第一天的 epoch day
+            // 计算滚动预算周期：起始日与周期起始月（重置日语义，由 computePeriod 统一）
             const now_secs: u64 = @intCast(@divTrunc(stats.timestamp_ms, std.time.ns_per_s));
             const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = now_secs };
             const epoch_day = epoch_seconds.getEpochDay();
             const year_day = epoch_day.calculateYearDay();
             const month_day = year_day.calculateMonthDay();
-            const first_day = quota.firstDayOfMonthEpochDay(year_day.year, month_day.month.numeric());
+            const period = quota.computePeriod(config.reset_day, year_day.year, month_day.month.numeric(), month_day.day_index + 1);
 
-            // 查询当月流量
-            const monthly_traffic = quota.getMonthlyTraffic(&stor.conn, @intCast(first_day)) catch |err| {
+            // 生成周期月份键（YYYY-MM），用于查询预算周期内配额调整记录
+            var month_key_buf: [16]u8 = undefined;
+            const month_key = periodMonthKey(&period, &month_key_buf) orelse {
+                log.warn("月份键生成失败", .{});
+                continue;
+            };
+
+            // 查询预算周期内流量
+            const monthly_traffic = quota.getMonthlyTraffic(&stor.conn, @intCast(period.start_epoch_day)) catch |err| {
                 log.warn("配额查询失败: {s}", .{@errorName(err)});
                 continue;
             };
 
+            // 获取当月有效配额（基础配额 + 临时调整）
+            const effective_quota = quota.getEffectiveMonthlyQuota(&stor.conn, config.quota_limit_bytes, month_key) catch |err| {
+                log.warn("有效配额计算失败: {s}", .{@errorName(err)});
+                continue;
+            };
+            // 临时调整总额 = 有效配额 - 基础配额（饱和减法，防止下溢）
+            const adjustment_total = std.math.sub(u64, effective_quota, config.quota_limit_bytes) catch 0;
+
             // 检查配额状态
             const quota_config = quota.QuotaConfig{
-                .limit_bytes = config.quota_limit_bytes,
+                .limit_bytes = effective_quota,
                 .warning_threshold = config.quota_warning_threshold,
                 .disconnect_threshold = config.quota_disconnect_threshold,
-                .reset_day = config.quota_reset_day,
+                .reset_day = config.reset_day,
             };
             const current_state = quota.checkQuota(quota_config, monthly_traffic);
 
@@ -909,16 +1151,20 @@ fn runLiveMonitorSqlite(io: std.Io, allocator: Allocator, config: AppConfig, sto
                     @tagName(prev_quota_state),
                     @tagName(current_state),
                     formatBytes(&rx_total_buf, monthly_traffic, ""),
-                    formatBytes(&tx_total_buf, config.quota_limit_bytes, ""),
+                    formatBytes(&tx_total_buf, effective_quota, ""),
                 });
 
                 // 发送通知
+                const base_quota = config.quota_limit_bytes;
                 sendQuotaNotification(
                     allocator,
                     io,
                     config,
                     iface,
                     monthly_traffic,
+                    effective_quota,
+                    base_quota,
+                    adjustment_total,
                     current_state,
                 );
 
@@ -970,6 +1216,9 @@ fn sendQuotaNotification(
     config: AppConfig,
     iface: []const u8,
     used_bytes: u64,
+    effective_quota: u64,
+    base_quota: u64,
+    adjustment_total: u64,
     state: quota.QuotaState,
 ) void {
     const timestamp_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
@@ -977,10 +1226,12 @@ fn sendQuotaNotification(
     // 构建模板变量
     const vars = notify_template.TemplateVariables{
         .interface = iface,
-        .quota = config.quota_limit_bytes,
+        .quota = effective_quota,
+        .base_quota = base_quota,
+        .adjustment_total = adjustment_total,
         .used = used_bytes,
-        .percent = if (config.quota_limit_bytes > 0)
-            @as(f64, @floatFromInt(used_bytes)) / @as(f64, @floatFromInt(config.quota_limit_bytes)) * 100.0
+        .percent = if (effective_quota > 0)
+            @as(f64, @floatFromInt(used_bytes)) / @as(f64, @floatFromInt(effective_quota)) * 100.0
         else
             0.0,
         .timestamp_ms = timestamp_ms,
@@ -1007,7 +1258,7 @@ fn sendQuotaNotification(
             iface,
             used_bytes,
             0, // tx_bytes (我们使用总流量)
-            config.quota_limit_bytes,
+            effective_quota,
         ) catch |err| {
             log.err("Webhook 通知失败: {s}", .{@errorName(err)});
             return;
@@ -1138,7 +1389,7 @@ fn sendQuotaNotification(
         @tagName(state),
         iface,
         formatBytes(&rx_buf, used_bytes, ""),
-        formatBytes(&tx_buf, config.quota_limit_bytes, ""),
+        formatBytes(&tx_buf, effective_quota, ""),
     });
 }
 
@@ -1369,4 +1620,5 @@ test {
     std.testing.refAllDecls(webhook);
     std.testing.refAllDecls(cfg);
     std.testing.refAllDecls(quota);
+    std.testing.refAllDecls(http_server);
 }

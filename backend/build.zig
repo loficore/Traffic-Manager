@@ -88,6 +88,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Source module: config_store (depends on zqlite + config)
+    const config_store_src = b.createModule(.{
+        .root_source_file = b.path("src/config_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    config_store_src.addImport("zqlite", zqlite_dep.module("zqlite"));
+    config_store_src.addImport("config", config_src);
+
     // Source module: log
     const log_src = b.createModule(.{
         .root_source_file = b.path("src/log.zig"),
@@ -130,6 +139,18 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Source module: http_server (depends on zqlite + config + quota + config_store + log)
+    const http_server_src = b.createModule(.{
+        .root_source_file = b.path("src/http_server.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    http_server_src.addImport("zqlite", zqlite_dep.module("zqlite"));
+    http_server_src.addImport("config", config_src);
+    http_server_src.addImport("quota", quota_src);
+    http_server_src.addImport("config_store", config_store_src);
+    http_server_src.addImport("log", log_src);
+
     // Test file definitions: (test_file, source_module_name, source_module)
     const test_defs = [_]struct {
         file: []const u8,
@@ -143,6 +164,9 @@ pub fn build(b: *std.Build) void {
         .{ .file = "tests/test_notify.zig", .src_name = "notify", .src_mod = notify_src },
         .{ .file = "tests/test_smtp.zig", .src_name = "smtp", .src_mod = smtp_src },
         .{ .file = "tests/test_webhook.zig", .src_name = "webhook", .src_mod = webhook_src },
+        .{ .file = "tests/test_config_store.zig", .src_name = "config_store", .src_mod = config_store_src },
+        .{ .file = "tests/test_http_server.zig", .src_name = "http_server", .src_mod = http_server_src },
+        .{ .file = "tests/test_integration.zig", .src_name = "config_store", .src_mod = config_store_src },
     };
 
     for (test_defs) |td| {
@@ -154,6 +178,14 @@ pub fn build(b: *std.Build) void {
             }),
         });
         test_mod.root_module.addImport(td.src_name, td.src_mod);
+        // 需要 zqlite 访问的测试模块
+        if (std.mem.eql(u8, td.src_name, "config_store") or std.mem.eql(u8, td.src_name, "quota") or std.mem.eql(u8, td.src_name, "http_server")) {
+            test_mod.root_module.addImport("zqlite", zqlite_dep.module("zqlite"));
+        }
+        // 集成测试额外依赖 quota（config 已通过 config_store 内部的 config 模块间接可用）
+        if (std.mem.eql(u8, td.file, "tests/test_integration.zig")) {
+            test_mod.root_module.addImport("quota", quota_src);
+        }
 
         const run_test_mod = b.addRunArtifact(test_mod);
         test_step.dependOn(&run_test_mod.step);

@@ -61,14 +61,30 @@ pub const SQLiteStorage = struct {
         \\    rx_speed_bps INTEGER NOT NULL DEFAULT 0,
         \\    tx_speed_bps INTEGER NOT NULL DEFAULT 0
         \\);
+        \\
+        \\-- 键值对配置表：存储应用级键值配置，主键为 key
+        \\CREATE TABLE IF NOT EXISTS config (
+        \\    key TEXT PRIMARY KEY,
+        \\    value TEXT NOT NULL
+        \\);
+        \\
+        \\-- 配额调整记录表：记录对月度配额的手动调整（增/减），用于审计
+        \\CREATE TABLE IF NOT EXISTS quota_adjustments (
+        \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\    amount_bytes INTEGER NOT NULL,
+        \\    reason TEXT NOT NULL DEFAULT '',
+        \\    source TEXT NOT NULL DEFAULT '',
+        \\    month_key TEXT NOT NULL,
+        \\    created_at INTEGER NOT NULL
+        \\);
     ;
 
     pub fn open(allocator: Allocator, io: Io, db_path: []const u8, home_dir: ?[]const u8, retention_days: u32) SQLiteError!SQLiteStorage {
         if (std.fs.path.dirname(db_path)) |dir| {
-            Io.Dir.createDirAbsolute(io, dir, .default_dir) catch |err| switch (err) {
-                error.PathAlreadyExists => {},
-                else => return SQLiteError.DatabaseInitFailed,
-            };
+            // 递归创建整条父目录链（createDirPath 按需逐级补齐缺失目录），
+            // 避免首启时 $HOME/.local/share 整链缺失导致建库失败而回退二进制；
+            // 目录已存在时直接成功，无需再区分 PathAlreadyExists。
+            Io.Dir.cwd().createDirPath(io, dir) catch return SQLiteError.DatabaseInitFailed;
         }
 
         const db_path_z = allocator.dupeZ(u8, db_path) catch return SQLiteError.OutOfMemory;

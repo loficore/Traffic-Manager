@@ -18,8 +18,12 @@ const Allocator = std.mem.Allocator;
 pub const TemplateVariables = struct {
     /// 网络接口名称（如 "eth0", "wlan0"）
     interface: []const u8,
-    /// 配额限制（原始字节数）
+    /// 有效配额（原始字节数，基础配额 + 临时调整）
     quota: u64,
+    /// 基础配额（原始字节数，不含临时调整，默认 0）
+    base_quota: u64 = 0,
+    /// 临时调整总额（原始字节数，所有当月调整之和，默认 0）
+    adjustment_total: u64 = 0,
     /// 已使用量（原始字节数）
     used: u64,
     /// 使用百分比（0.0 - 100.0）
@@ -40,11 +44,11 @@ pub const TemplateError = error{
 
 /// 默认警告模板 - 当流量使用达到阈值时发送
 pub const default_warning_template: []const u8 =
-    "[警告] {interface} 流量已使用 {used}/{quota} ({percent}%) - {timestamp}";
+    "[警告] {interface} 流量已使用 {used}/{quota} ({percent}%) 基础配额:{base_quota} 临时调整:{adjustment_total} - {timestamp}";
 
 /// 默认断网模板 - 当流量超过配额时发送
 pub const default_disconnect_template: []const u8 =
-    "[断网] {interface} 流量超限! 已用 {used}/{quota} ({percent}%) - {timestamp}";
+    "[断网] {interface} 流量超限! 已用 {used}/{quota} ({percent}%) 基础配额:{base_quota} 临时调整:{adjustment_total} - {timestamp}";
 
 /// 默认自定义模板示例
 pub const default_custom_template: []const u8 =
@@ -128,6 +132,10 @@ fn resolveVariable(name: []const u8, vars: TemplateVariables) TemplateError![]co
         return vars.interface;
     } else if (std.mem.eql(u8, name, "quota")) {
         return formatBytesForTemplate(&buf, vars.quota);
+    } else if (std.mem.eql(u8, name, "base_quota")) {
+        return formatBytesForTemplate(&buf, vars.base_quota);
+    } else if (std.mem.eql(u8, name, "adjustment_total")) {
+        return formatBytesForTemplate(&buf, vars.adjustment_total);
     } else if (std.mem.eql(u8, name, "used")) {
         return formatBytesForTemplate(&buf, vars.used);
     } else if (std.mem.eql(u8, name, "percent")) {
