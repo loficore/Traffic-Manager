@@ -161,6 +161,61 @@ Open `http://localhost:8080` in a browser. The dashboard has four tabs — **Das
 
 The dashboard HTML is embedded into the binary at compile time (see the build flow below), so no separate web server or static files are needed at runtime.
 
+### Docker 式使用（trafficctl 控制通道）
+
+`--sqlite` 模式会恒开一个 unix socket 控制通道，配合 `trafficctl` 客户端即可像操作容器/守护进程一样随时查询与控制，无需依赖 Web 面板。二进制后端（默认存储）不提供控制通道，`--socket` 必须与 `--sqlite` 同时给出，否则启动即拒绝并报错。
+
+启动守护进程并暴露控制通道（命令行可直接照抄）：
+
+```bash
+# 启动守护（root 或对 socket 有读写权限的用户）
+traffic-backend --daemon --sqlite \
+  --socket /run/traffic-manager.sock \
+  --pid-file /run/traffic-manager.pid
+
+# 随时查询与控制
+trafficctl status                               # 运行状态
+trafficctl current                              # 实时速率与累计流量
+trafficctl history 7                            # 最近 N 天每日流量（默认 7）
+trafficctl config                               # 当前配置
+trafficctl config set reset-day=28              # 修改配置（白名单 key）
+trafficctl quota                                # 当月配额快照
+trafficctl quota list                           # 当月配额调整记录
+trafficctl quota add 500MB --reason "hello, world"
+trafficctl quota rm 1                           # 删除当月配额调整
+```
+
+`trafficctl`（`zig-out/bin/trafficctl`，只走 unix socket，不依赖 Web 端口）子命令一览：
+
+| 子命令 | 说明 |
+|---|---|
+| `status` | 查询守护进程运行状态 |
+| `current` | 查询实时速率与累计流量 |
+| `history [N]` | 查询最近 N 天每日流量（默认 7） |
+| `config` | 查询当前配置 |
+| `config set K=V...` | 设置配置项（白名单 key，见下） |
+| `quota` | 查询当月配额快照 |
+| `quota list` | 查询当月配额调整记录 |
+| `quota add SIZE [--reason R] [--source S]` | 追加当月配额调整（SIZE 为可读大小，如 `500MB`） |
+| `quota rm ID` | 删除当月配额调整 |
+
+全局选项 `--socket <path>` 指定 socket 路径、`--json` 原样输出 JSON，二者可出现在子命令前后。退出码约定：`0` 成功 / `1` 守护进程不可达 / `2` 参数错误 / `3` HTTP 非 2xx。
+
+`config set` 只接受白名单内的 key：`interface`、`interval`、`retention`、`reset-day`、`quota-limit`、`quota-warning`、`quota-disconnect`、`webhook-url`、`smtp-server`、`smtp-port`、`smtp-user`、`smtp-pass`、`smtp-from`、`smtp-to`。其中 `interface`（网卡）与 `retention`（保留天数）需要重启守护进程后才生效，其余 key 实时生效。
+
+#### Socket 路径与权限
+
+`trafficctl` 与守护进程按同一优先级解析默认 socket 路径：
+
+1. 显式 `--socket <path>` → 原样使用；
+2. `$XDG_RUNTIME_DIR` 非空且可写 → `<xdg>/traffic-manager.sock`；
+3. `<home>/.local/run/traffic-manager.sock`；
+4. 无 HOME → `/tmp/traffic-manager.sock`。
+
+非 root 守护无需特权即可用默认路径：桌面会话或 systemd 用户实例设置了 `$XDG_RUNTIME_DIR`，socket 自动落在 `/run/user/<uid>/traffic-manager.sock`，对该用户天然隔离。客户端默认按同一规则解析到同一个 socket；需要连接其它位置的守护时用 `--socket` 显式覆盖即可（环境变量方式未实现，请勿依赖 `TRAFFIC_MANAGER_SOCKET`）。
+
+socket 文件属主为运行守护进程的用户。程序在 unix socket 绑定成功后对监听 socket 路径显式执行 `chmod(0660)`（失败仅记日志、不致命），因此无论 `--daemon` 模式（umask 被置 0）还是前台模式，socket 权限一律固定为 `0660`（仅运行用户及其同组用户可访问），无需外部 `chmod` 或改前台运行以收紧权限。
+
 ## Command-line options
 
 | Option | Description | Default |
@@ -173,6 +228,7 @@ The dashboard HTML is embedded into the binary at compile time (see the build fl
 | `-f`, `--foreground` | Force foreground (conflicts with `--daemon`) | |
 | `--pid-file <path>` | PID file location | `/var/run/traffic-manager.pid` |
 | `--log-file <path>` | Log file location | `/var/log/traffic-manager.log` |
+| `--socket <path>` | Unix socket path for the control channel (requires `--sqlite`; see "Docker 式使用" below) | Auto (XDG → home → `/tmp`) |
 | `--sqlite` | Use SQLite storage | |
 | `--no-sqlite` | Use binary file storage | Binary |
 | `--retention-days <n>` | Days to keep sample data | 30 |
@@ -193,7 +249,7 @@ Create `/etc/init.d/traffic-manager`:
 name="traffic-manager"
 description="Network traffic monitor"
 command="/usr/local/bin/traffic-backend"
-command_args="--daemon --sqlite --pid-file /run/traffic-manager.pid --log-file /var/log/traffic-manager.log"
+command_args="--daemon --sqlite --pid-file /run/traffic-manager.pid --log-file /var/log/traffic-manager.log --socket /var/run/traffic-manager.sock"
 pidfile="/run/traffic-manager.pid"
 
 depend() {
@@ -204,6 +260,7 @@ depend() {
 start_pre() {
     checkpath --directory --owner root:root --mode 0755 /run/traffic-manager
     checkpath --directory --owner root:root --mode 0755 /var/log
+    checkpath --directory --owner root:root --mode 0755 /var/run
 }
 ```
 
@@ -227,7 +284,8 @@ Wants=network-online.target
 
 [Service]
 Type=forking
-ExecStart=/usr/local/bin/traffic-backend --daemon --sqlite --pid-file /run/traffic-manager.pid --log-file /var/log/traffic-manager.log
+RuntimeDirectory=traffic-manager
+ExecStart=/usr/local/bin/traffic-backend --daemon --sqlite --pid-file /run/traffic-manager.pid --log-file /var/log/traffic-manager.log --socket /run/traffic-manager.sock
 PIDFile=/run/traffic-manager.pid
 Restart=on-failure
 RestartSec=5
@@ -266,7 +324,7 @@ LOGFILE=/var/log/traffic-manager.log
 case "$1" in
     start)
         echo "Starting traffic-manager..."
-        $DAEMON --daemon --sqlite --pid-file $PIDFILE --log-file $LOGFILE
+        $DAEMON --daemon --sqlite --pid-file $PIDFILE --log-file $LOGFILE --socket /run/traffic-manager.sock
         ;;
     stop)
         echo "Stopping traffic-manager..."
@@ -308,10 +366,11 @@ update-rc.d traffic-manager defaults
 |---|---|
 | `$HOME/.local/share/traffic-manager/state.bin` | Binary storage (default backend) |
 | `$HOME/.local/share/traffic-manager/traffic.db` | SQLite database |
+| `$XDG_RUNTIME_DIR/traffic-manager.sock` | Control-channel unix socket (falls back to `$HOME/.local/run/`, then `/tmp/`; override with `--socket`) |
 | `/var/run/traffic-manager.pid` | PID file (falls back to `/tmp/`) |
 | `/var/log/traffic-manager.log` | Log file (falls back to `/tmp/`) |
 
-If `/var/run/` or `/var/log/` are not writable, the program falls back to `/tmp/` automatically.
+If `/var/run/` or `/var/log/` are not writable, the program falls back to `/tmp/` automatically. The control-channel socket is only bound in `--sqlite` mode (the binary backend has no control channel).
 
 ## Troubleshooting
 

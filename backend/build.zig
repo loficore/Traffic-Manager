@@ -73,13 +73,50 @@ pub fn build(b: *std.Build) void {
     // Each test file imports its source module by name (e.g. @import("quota")).
     // The build system wires the source module as a named dependency.
 
-    // Source module: quota (depends on zqlite)
+    // Source module: common (dep-free；供 quota 与后续 client 共享 parseTrafficUnit/resolveSocketPath)
+    const common_src = b.createModule(.{
+        .root_source_file = b.path("src/common.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // ── Source module: client (trafficctl) ──
+    // 独立 CLI 客户端：不链 libc / zqlite / SMTP / vendor C（D1），
+    // 仅经命名 import 引入 common 的共享纯函数。
+    const client_src = b.createModule(.{
+        .root_source_file = b.path("src/client.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    client_src.addImport("common", common_src);
+
+    // trafficctl 可执行文件（root src/client.zig），安装到 zig-out/bin/
+    const client_exe = b.addExecutable(.{
+        .name = "trafficctl",
+        .root_module = client_src,
+    });
+    b.installArtifact(client_exe);
+
+    // trafficctl 内联测试 target（root src/client.zig）：纯函数单测挂进 zig build test
+    const client_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/client.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    client_unit_tests.root_module.addImport("common", common_src);
+    const run_client_unit_tests = b.addRunArtifact(client_unit_tests);
+    test_step.dependOn(&run_client_unit_tests.step);
+
+    // Source module: quota (depends on zqlite + common)
     const quota_src = b.createModule(.{
         .root_source_file = b.path("src/quota.zig"),
         .target = target,
         .optimize = optimize,
     });
     quota_src.addImport("zqlite", zqlite_dep.module("zqlite"));
+    quota_src.addImport("common", common_src);
 
     // Source module: config
     const config_src = b.createModule(.{

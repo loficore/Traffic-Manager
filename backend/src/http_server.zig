@@ -1,10 +1,13 @@
 // backend/src/http_server.zig
-// HTTP 服务器模块：在独立线程中基于 posix fd 运行 TCP 监听，
-// 通过自旋锁保护的共享状态与监控线程通信。
+// HTTP 服务器模块：在独立线程中基于 posix fd 运行监听，
+// 支持 unix socket 与 TCP 两种监听器，通过自旋锁保护的共享状态与监控线程通信。
 //
 // 设计要点（Plan Wave 3）：
-// - 端口预绑定：socket/bind/listen 在 startHttpServer 调用线程内同步完成，
-//   端口被占用等错误立即返回调用方，线程只做 accept，避免静默失败。
+// - 监听器分步绑定：每个监听器的 socket/bind/listen 在 startHttpServer 调用线程内同步完成，
+//   端口/路径被占用等错误立即返回调用方，线程只做 accept，避免静默失败。
+// - unix socket 默认恒开（ctx.socket_path 非空即绑定），TCP 由 ctx.port > 0 触发；
+//   每个监听器绑定成功后立即各派生一个 accept 线程（先 unix 后 TCP，互不影响），
+//   二者共用同一套 HTTP 处理逻辑；TCP 失败不再连带牺牲已就绪的 unix 控制通道。
 // - 所有 API 数据均实时查询 SQLite / 读取 /proc/net/dev，不依赖监控线程
 //   写入共享状态（监控循环无需触碰 http 线程状态，降低耦合与锁竞争）。
 // - 自旋锁替代 Zig 0.16 已移除的 std.Thread.Mutex，保护共享配置指针与
@@ -15,7 +18,9 @@ const zqlite = @import("zqlite");
 const EMBEDDED_HTML = @embedFile("dashboard.html");
 const traffic_mod = @import("traffic.zig");
 const quota_mod = @import("quota.zig");
-const cfg = @import("config.zig");
+// pub re-export：测试 fixture 经 http_server.cfg 构造共享配置对象；
+// 避免 root 模块直接 import "config" 与模块内相对 import 产生双重身份冲突。
+pub const cfg = @import("config.zig");
 const cfg_store = @import("config_store.zig");
 const log = @import("log.zig");
 
@@ -30,6 +35,9 @@ const Stream = std.posix.socket_t;
 pub const HttpServerError = error{
     BindFailed,
     ListenFailed,
+    // unix socket 绑定/监听失败：区别于 TCP 的 BindFailed，
+    // 供调用方（todo 5）将其升级为启动致命错误
+    SocketBindFailed,
     SystemResources,
     OutOfMemory,
     LockedMemoryLimitExceeded,
@@ -68,8 +76,10 @@ pub const AppState = struct {
     /// 流量取样器：按请求间隔连续读取 /proc/net/dev，
     /// 在前后两次请求之间计算实时速率（与监控线程各自持有独立样本）。
     tracker: traffic_mod.TrafficTracker = traffic_mod.TrafficTracker.init(null),
-    /// 当前生效配置（PUT /api/config 会就地更新）
-    config: cfg.Config = .{},
+    /// 共享 live 配置：指向进程生命周期内稳定的 cfg.Config（main 中 live_config 全字段拷贝）。
+    /// HTTP 线程经此指针就地更新（PUT /api/config）；监控线程后续直接读取同一对象，
+    /// 使配置变更运行时实时生效，无需重启。指针指向的对象由 main 持有，此处不做内存管理。
+    config: *cfg.Config,
     /// 正在监听的目标网卡名（由监控线程启动时传入的生命期稳定的字符串）
     iface: []const u8 = "",
     /// 服务器启动时间（epoch 秒），用于计算 uptime
@@ -82,36 +92,126 @@ pub const HttpServerContext = struct {
     state: *AppState,
     conn: *zqlite.Conn,
     port: u16,
+    /// 可选 unix socket 监听路径：非空则恒开 AF.UNIX 监听器；
+    /// 为空则仅当 port > 0 时监听 TCP。路径字节需在调用方生命周期内有效。
+    socket_path: ?[]const u8 = null,
     /// 监控主循环的 Io 实例：HTTP 线程复用其读取 /proc/net/dev
     io: std.Io,
 };
 
-/// 启动 HTTP 服务器。
-/// 采用「主线程预绑定」策略：socket/bind/listen 全部在调用线程同步完成，
-/// 任何一步失败（典型如端口被占用）都返回显式错误给调用方，而非在线程里
-/// 静默退出——这样 main.zig 能在启动阶段就确定端口冲突并提示用户。
-/// 成功后才派生子线程进入 accept 循环；失败时通过 errdefer 关闭 fd。
-pub fn startHttpServer(ctx: HttpServerContext) HttpServerError!std.Thread {
-    // 创建 TCP 监听套接字（IPv4，0.0.0.0）
-    const sock_result = linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0);
-    if (linux.errno(sock_result) != .SUCCESS) return error.SystemResources;
-    const sockfd: Stream = @intCast(sock_result);
-    errdefer _ = linux.close(sockfd);
-    // 允许地址复用，避免重启时 TIME_WAIT 导致 bind 失败
-    const one: c_int = 1;
-    std.posix.setsockopt(sockfd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&one)) catch {};
-    const addr = std.posix.sockaddr.in{
-        .family = std.posix.AF.INET,
-        .port = std.mem.nativeToBig(u16, ctx.port),
-        .addr = 0, // 0.0.0.0
-        .zero = [_]u8{0} ** 8,
-    };
-    const bind_rc = linux.bind(sockfd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
-    if (linux.errno(bind_rc) != .SUCCESS) return error.BindFailed;
-    const listen_rc = linux.listen(sockfd, 128);
-    if (linux.errno(listen_rc) != .SUCCESS) return error.ListenFailed;
-    // 绑定/监听成功后派生 accept 线程（失败时 errdefer 关闭 fd）
-    return std.Thread.spawn(.{}, serverThreadFn, .{ ctx, sockfd });
+/// 启动 HTTP 服务器（多监听器）。
+/// 采用「每监听器独立绑定 → 立即派生」策略：unix socket（恒开）与 TCP（可选）
+/// 各自完成 socket/bind/listen 后立即派生自己的 accept 线程（detach，OS 回收），
+/// 二者不再互相牵连。顺序固定为 unix 先、TCP 后：unix 绑定或线程派生失败返回
+/// SocketBindFailed（main 视为启动致命错误，D4）；TCP 失败仅关闭本次创建的 fd 并返回
+/// BindFailed/ListenFailed，已就绪的 unix 控制通道不受影响——main 的 warn-and-continue
+/// 分支下进程存活且 trafficctl 依然可用（修复「TCP 占用导致 unix 通道被连带关闭」缺陷）。
+/// 返回 void：线程句柄自持，调用方无需管理。
+pub fn startHttpServer(ctx: HttpServerContext) HttpServerError!void {
+    // 1) unix socket 监听：恒定开启（只要 ctx.socket_path 非空）。
+    //    绑定成功后立即派生 accept 线程（fd 所有权移交线程），本函数不再管理该 fd；
+    //    后续 TCP 段失败不会回滚已就绪的 unix 监听器。
+    if (ctx.socket_path) |path| {
+        // 路径转 NUL 结尾（unlink 与 sockaddr.path 共用），NameTooLong 视为绑定失败
+        const path_z = std.posix.toPosixPath(path) catch return error.SocketBindFailed;
+        // 清理陈旧 socket 文件：上次异常退出可能残留，bind 前先 unlink；
+        // ENOENT 表示本就不存在，属正常情况
+        const unlink_rc = linux.unlink(&path_z);
+        const unlink_errno = linux.errno(unlink_rc);
+        if (unlink_errno != .SUCCESS and unlink_errno != .NOENT) {
+            log.warn("清理陈旧 unix socket 文件失败: {s}", .{@tagName(unlink_errno)});
+        }
+
+        const sock_result = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM, 0);
+        if (linux.errno(sock_result) != .SUCCESS) return error.SystemResources;
+        const sockfd: Stream = @intCast(sock_result);
+
+        // 路径不得超过 sun_path 容量（108 字节），否则 sockaddr 拷不下
+        if (path.len >= 108) {
+            _ = linux.close(sockfd);
+            return error.SocketBindFailed;
+        }
+        // sockaddr.un：family + 108 字节 path；整体清零保证 NUL 结尾，
+        // 内核以空串终止方式解析路径长度。用 linux.sockaddr.un 而非
+        // std.posix.sockaddr.un：本模块链接 libc 后 posix.sockaddr 解析为
+        // std.c.sockaddr（含 len 前缀 + 104 字节 path），与 108 字节约定不符。
+        var sock_addr: linux.sockaddr.un = .{ .path = [_]u8{0} ** 108 };
+        @memcpy(sock_addr.path[0..path.len], path);
+
+        const bind_rc = linux.bind(sockfd, @ptrCast(&sock_addr), @sizeOf(linux.sockaddr.un));
+        if (linux.errno(bind_rc) != .SUCCESS) {
+            _ = linux.close(sockfd);
+            return error.SocketBindFailed;
+        }
+        const listen_rc = linux.listen(sockfd, 128);
+        if (linux.errno(listen_rc) != .SUCCESS) {
+            _ = linux.close(sockfd);
+            return error.SocketBindFailed;
+        }
+
+        // D4：socket 文件权限显式收紧为 0660——daemon 模式 umask(0) 默认会得到 0777，
+        // 非 root 同机用户可连。注意必须用 path 形态的 chmod：对已 bind 的 AF_UNIX
+        // fd 做 fchmod 只会改 sockfs 伪文件系统 inode 的权限位，path 视图的实际
+        // 文件权限不受影响（实测 fchmod 返回 0 而 stat 仍为 bind 时 umask 产物），
+        // chmod(path) 走的才是真实文件系统 inode。失败不致命，仅记警告。
+        const chmod_rc = linux.chmod(&path_z, 0o660);
+        if (linux.errno(chmod_rc) != .SUCCESS) {
+            log.warn("设置 unix socket 文件权限 0660 失败: {s}", .{@tagName(linux.errno(chmod_rc))});
+        }
+
+        // 立即派生 accept 线程；spawn 失败视为启动失败（SocketBindFailed）：
+        // socket 文件已残留但无人监听，若 warn-and-continue 会让 trafficctl 拿到
+        // ECONNREFUSED，与控制通道不可用同等级，交由 main 致命退出
+        const unix_thread = std.Thread.spawn(.{}, serverThreadFn, .{ ctx, sockfd }) catch {
+            _ = linux.close(sockfd);
+            return error.SocketBindFailed;
+        };
+        // detach：线程自持 fd 与 ctx，进程退出时由 OS 回收
+        unix_thread.detach();
+    }
+
+    // 2) TCP 监听：可选（ctx.port > 0），保持既有 AF.INET 行为不变。
+    //    TCP 段失败仅关闭本次创建的 fd 并返回错误，不影响已就绪的 unix 监听器。
+    if (ctx.port > 0) {
+        // 创建 TCP 监听套接字（IPv4，0.0.0.0）
+        const sock_result = linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0);
+        if (linux.errno(sock_result) != .SUCCESS) return error.SystemResources;
+        const sockfd: Stream = @intCast(sock_result);
+        // 允许地址复用，避免重启时 TIME_WAIT 导致 bind 失败
+        const one: c_int = 1;
+        std.posix.setsockopt(sockfd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&one)) catch {};
+        const addr = std.posix.sockaddr.in{
+            .family = std.posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, ctx.port),
+            .addr = 0, // 0.0.0.0
+            .zero = [_]u8{0} ** 8,
+        };
+        const bind_rc = linux.bind(sockfd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
+        if (linux.errno(bind_rc) != .SUCCESS) {
+            _ = linux.close(sockfd);
+            return error.BindFailed;
+        }
+        const listen_rc = linux.listen(sockfd, 128);
+        if (linux.errno(listen_rc) != .SUCCESS) {
+            _ = linux.close(sockfd);
+            return error.ListenFailed;
+        }
+
+        // 派生 TCP accept 线程：spawn 失败仅关闭 TCP fd（unix 控制通道不受影响）
+        const tcp_thread = std.Thread.spawn(.{}, serverThreadFn, .{ ctx, sockfd }) catch {
+            _ = linux.close(sockfd);
+            return error.SystemResources;
+        };
+        tcp_thread.detach();
+    }
+}
+
+/// 删除 unix socket 文件（进程退出或信号处理路径）。
+/// 与 pidfile.removePidFile 同款无分配实现，可在信号处理器中安全调用；
+/// 文件不存在时静默忽略（toPosixPath 失败即返回）。
+pub fn removeSocketFile(path: []const u8) void {
+    const path_z = std.posix.toPosixPath(path) catch return;
+    _ = linux.unlink(&path_z);
 }
 
 /// 服务器线程主函数：套接字已在主线程就绪（预绑定），这里只负责 accept
@@ -258,10 +358,10 @@ fn computeQuotaSnapshot(ctx: HttpServerContext) !QuotaSnapshot {
     ctx.state.mu.lock();
     defer ctx.state.mu.unlock();
 
-    const base = ctx.state.config.quota_limit_bytes;
-    const warning = ctx.state.config.quota_warning_threshold;
-    const disconnect = ctx.state.config.quota_disconnect_threshold;
-    const reset_day = ctx.state.config.reset_day;
+    const base = ctx.state.config.*.quota_limit_bytes;
+    const warning = ctx.state.config.*.quota_warning_threshold;
+    const disconnect = ctx.state.config.*.quota_disconnect_threshold;
+    const reset_day = ctx.state.config.*.reset_day;
 
     // 计算滚动预算周期：起始日与周期起始月（重置日语义，由 computePeriod 统一）
     const now_secs: u64 = @intCast(unixTimeSecs());
@@ -455,19 +555,45 @@ fn appendJsonString(buf: []u8, pos: *usize, s: []const u8) bool {
                 buf[pos.*] = '\\';
                 pos.* += 1;
             },
-            0...31 => {
-                // 控制字符使用 \u00XX 转义，保证 JSON 合法性
+            '\n' => {
+                // 换行转义为较短的人类可读形式，而非 \u000A
+                if (buf.len - pos.* < 2) return false;
+                buf[pos.*] = '\\';
+                pos.* += 1;
+                buf[pos.*] = 'n';
+                pos.* += 1;
+            },
+            '\r' => {
+                if (buf.len - pos.* < 2) return false;
+                buf[pos.*] = '\\';
+                pos.* += 1;
+                buf[pos.*] = 'r';
+                pos.* += 1;
+            },
+            '\t' => {
+                if (buf.len - pos.* < 2) return false;
+                buf[pos.*] = '\\';
+                pos.* += 1;
+                buf[pos.*] = 't';
+                pos.* += 1;
+            },
+            0...8, 11, 12, 14...31 => {
+                // 其余控制字符（排除已单列处理的 \t \n \r）用 \u00XX 转义
                 if (buf.len - pos.* < 7) return false;
                 const esc = std.fmt.bufPrint(buf[pos.*..], "\\u00{X:0>2}", .{c}) catch return false;
                 pos.* += esc.len;
             },
             else => {
+                // 可打印 ASCII 与 >= 0x80 的 UTF-8 字节原样透传，
+                // 避免逐字节转义破坏多字节字符（如中文 smtp_from）
                 if (buf.len - pos.* < 1) return false;
                 buf[pos.*] = c;
                 pos.* += 1;
             },
         }
     }
+    // 收尾闭合引号前检查剩余空间（与 client.zig 同款），避免缓冲恰好写满时越界 1 字节
+    if (buf.len - pos.* < 1) return false;
     buf[pos.*] = '"';
     pos.* += 1;
     return true;
@@ -524,7 +650,7 @@ fn appendNumField(buf: []u8, pos: *usize, first: *bool, key: []const u8, value: 
 
 fn handleGetConfigApi(ctx: HttpServerContext, stream: Stream) void {
     ctx.state.mu.lock();
-    const c = ctx.state.config;
+    const c = ctx.state.config.*;
     ctx.state.mu.unlock();
 
     // 输出完整配置（与 config_store.saveAll 覆盖的字段一致，可 PUT-GET 往返）
@@ -562,7 +688,8 @@ fn sendErr(stream: Stream) void {
 
 /// 将配置中的字符串字段复制为独立分配，使配置不再引用临时解析内存。
 /// 返回 false 表示内存不足。
-fn ownConfigStrings(allocator: Allocator, c: *cfg.Config) bool {
+/// pub：main.zig 初始化共享 live_config 时复用此自持拷贝逻辑。
+pub fn ownConfigStrings(allocator: Allocator, c: *cfg.Config) bool {
     if (c.interface) |v| c.interface = allocator.dupe(u8, v) catch return false;
     if (c.log_file) |v| c.log_file = allocator.dupe(u8, v) catch return false;
     if (c.pid_file) |v| c.pid_file = allocator.dupe(u8, v) catch return false;
@@ -578,6 +705,8 @@ fn ownConfigStrings(allocator: Allocator, c: *cfg.Config) bool {
 
 /// PUT /api/config：解析部分 JSON 配置，合并到当前配置后写回 SQLite config 表，
 /// 并就地更新共享状态使 GET 立即返回新值；重启后由 runDemo 的 ConfigStore 重载生效。
+/// copy-then-save：锁内完成合并、字符串自持与指针更新（监控循环周期顶部的快照锁
+/// 只与这几步互斥），saveAll 落库移到锁外，避免监控循环被 SQLite 慢写入阻塞（D3）。
 /// 注意：重复 PUT 会丢弃旧字符串字段，与现有代码对 state.config 不做深度释放的
 /// 风格一致，属可接受的小内存滞留。
 fn handlePutConfigApi(ctx: HttpServerContext, stream: Stream, request: []const u8) void {
@@ -601,25 +730,23 @@ fn handlePutConfigApi(ctx: HttpServerContext, stream: Stream, request: []const u
 
     ctx.state.mu.lock();
     // 以当前生效配置为基础，覆盖 JSON 中出现的字段
-    var merged = cfg.mergeConfigs(ctx.state.config, parsed.config, parsed.source);
+    var merged = cfg.mergeConfigs(ctx.state.config.*, parsed.config, parsed.source);
     // 字符串字段自持拷贝，避免后续释放 parsed 后悬垂
     if (!ownConfigStrings(ctx.allocator, &merged)) {
         ctx.state.mu.unlock();
         sendJson(stream, 500, "{\"error\":\"out of memory\"}");
         return;
     }
-
-    // 写回 SQLite config 表；重启后依然生效
-    const store = cfg_store.ConfigStore.init(ctx.conn, ctx.allocator);
-    if (store.saveAll(merged)) |_| {} else |_| {
-        ctx.state.mu.unlock();
-        sendJson(stream, 500, "{\"error\":\"db error\"}");
-        return;
-    }
-
-    // 更新共享配置，使 GET 立即返回新值
-    ctx.state.config = merged;
+    // 更新共享配置（就地写入指针指向的对象），使 GET 与监控循环快照立即读到新值
+    ctx.state.config.* = merged;
     ctx.state.mu.unlock();
+
+    // 锁外落库：merged 字符串已自持（ownConfigStrings 拷贝），unlock 后仍可安全引用。
+    // saveAll 失败不回滚内存指针——运行中的新值继续生效，仅记日志，下次 PUT 重试写库
+    const store = cfg_store.ConfigStore.init(ctx.conn, ctx.allocator);
+    store.saveAll(merged) catch |err| {
+        log.warn("配置持久化到 SQLite 失败: {s}", .{@errorName(err)});
+    };
 
     // 响应完整新配置
     var buf: [4096]u8 = undefined;
@@ -684,15 +811,17 @@ fn handleGetAdjustmentsApi(ctx: HttpServerContext, stream: Stream) void {
     const epoch_day = epoch_seconds.getEpochDay();
     const year_day = epoch_day.calculateYearDay();
     const month_day = year_day.calculateMonthDay();
-    const period = quota_mod.computePeriod(ctx.state.config.reset_day, year_day.year, month_day.month.numeric(), month_day.day_index + 1);
 
+    ctx.state.mu.lock();
+    // config 读取与 listAdjustments 同锁（与 PUT /api/config 更新的单锁纪律一致）：
+    // reset_day 快照随本函数最近一次有效读，避免锁外读共享配置对象
+    const period = quota_mod.computePeriod(ctx.state.config.*.reset_day, year_day.year, month_day.month.numeric(), month_day.day_index + 1);
     var month_key_buf: [16]u8 = undefined;
     const month_key = std.fmt.bufPrint(&month_key_buf, "{d:0>4}-{d:0>2}", .{ period.year, period.month }) catch {
+        ctx.state.mu.unlock();
         sendJson(stream, 500, "{\"error\":\"format error\"}");
         return;
     };
-
-    ctx.state.mu.lock();
     const adjustments = quota_mod.listAdjustments(ctx.allocator, ctx.conn, month_key) catch {
         ctx.state.mu.unlock();
         sendJson(stream, 500, "{\"error\":\"db error\"}");
@@ -841,7 +970,7 @@ fn handlePostAdjustmentApi(ctx: HttpServerContext, stream: Stream, request: []co
     const epoch_day = epoch_seconds.getEpochDay();
     const year_day = epoch_day.calculateYearDay();
     const month_day = year_day.calculateMonthDay();
-    const period = quota_mod.computePeriod(ctx.state.config.reset_day, year_day.year, month_day.month.numeric(), month_day.day_index + 1);
+    const period = quota_mod.computePeriod(ctx.state.config.*.reset_day, year_day.year, month_day.month.numeric(), month_day.day_index + 1);
 
     var month_key_buf: [16]u8 = undefined;
     const month_key = std.fmt.bufPrint(&month_key_buf, "{d:0>4}-{d:0>2}", .{ period.year, period.month }) catch {
@@ -937,4 +1066,37 @@ test "extractJsonField: 转义引号不截断" {
     const got = extractJsonField(body, "\"reason\":");
     try std.testing.expect(got != null);
     try std.testing.expectEqualStrings("say \\\"hi\\\"", got.?);
+}
+
+// ── appendJsonString 转义 Roundtrip 测试 ──
+
+// 目标：多字节 UTF-8（中文）与 < > 等可打印字符原样透传，
+// 序列化结果经 std.json.parseFromSlice 回读不丢失（反例：逐字节 \u00XX 转义会破坏一字多字节）
+test "appendJsonString: 中文 smtp_from roundtrip" {
+    var buf: [512]u8 = undefined;
+    var pos: usize = 0;
+    var first = true;
+    buf[pos] = '{';
+    pos += 1;
+    try std.testing.expect(appendStrField(&buf, &pos, &first, "smtp_from", "发件人<中文>"));
+    buf[pos] = '}';
+    pos += 1;
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, buf[0..pos], .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("发件人<中文>", parsed.value.object.get("smtp_from").?.string);
+}
+
+// 目标：ASCII 引号必须转义为 \"（精确输出比对 + 解析回读双重断言，无回归）
+test "appendJsonString: ASCII 引号转义" {
+    var buf: [64]u8 = undefined;
+    var pos: usize = 0;
+    try std.testing.expect(appendJsonString(&buf, &pos, "say \"hi\""));
+
+    // 序列化输出必须精确为 "say \"hi\""
+    try std.testing.expectEqualStrings("\"say \\\"hi\\\"\"", buf[0..pos]);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, buf[0..pos], .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("say \"hi\"", parsed.value.string);
 }

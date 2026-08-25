@@ -9,6 +9,11 @@ const zqlite = @import("zqlite");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
+// 共享工具模块：流量单位解析（parseTrafficUnit）已迁至 common.zig，此处仅 re-export，
+// 对外符号与错误行为保持不变，main.zig 与既有测试无需改动。
+pub const common = @import("common.zig");
+pub const parseTrafficUnit = common.parseTrafficUnit;
+
 pub const QuotaError = error{
     InvalidUnit,
     Overflow,
@@ -39,55 +44,6 @@ pub const QuotaState = enum {
     /// Usage at or above disconnect threshold.
     exceeded,
 };
-
-/// Parse a human-readable traffic unit string into bytes.
-/// Supports: B, KB, MB, GB, TB (case-insensitive).
-/// Bare numbers are interpreted as bytes.
-pub fn parseTrafficUnit(input: []const u8) QuotaError!u64 {
-    if (input.len == 0) return QuotaError.InvalidUnit;
-
-    // Find where digits end and unit begins
-    var digit_end: usize = 0;
-    while (digit_end < input.len and isDigit(input[digit_end])) : (digit_end += 1) {}
-
-    if (digit_end == 0) return QuotaError.InvalidUnit;
-
-    const num_str = input[0..digit_end];
-    const unit_str = input[digit_end..];
-
-    const num = std.fmt.parseInt(u64, num_str, 10) catch return QuotaError.InvalidUnit;
-
-    const multiplier: u64 = if (unit_str.len == 0)
-        1
-    else
-        unitToMultiplier(unit_str) orelse return QuotaError.InvalidUnit;
-
-    // Check for overflow
-    const result = std.math.mul(u64, num, multiplier) catch return QuotaError.Overflow;
-    return result;
-}
-
-fn isDigit(c: u8) bool {
-    return c >= '0' and c <= '9';
-}
-
-fn unitToMultiplier(unit: []const u8) ?u64 {
-    // Normalize to uppercase for case-insensitive matching
-    if (unit.len == 0) return null;
-
-    const multipliers = [_]struct { suffix: []const u8, value: u64 }{
-        .{ .suffix = "B", .value = 1 },
-        .{ .suffix = "KB", .value = 1024 },
-        .{ .suffix = "MB", .value = 1024 * 1024 },
-        .{ .suffix = "GB", .value = 1024 * 1024 * 1024 },
-        .{ .suffix = "TB", .value = 1024 * 1024 * 1024 * 1024 },
-    };
-
-    for (multipliers) |m| {
-        if (std.ascii.eqlIgnoreCase(unit, m.suffix)) return m.value;
-    }
-    return null;
-}
 
 /// 查询预算周期内的流量总量（rx + tx 字节）自 SQLite daily_traffic 表。
 /// period_start_epoch_day 为周期起始日的 epoch day 号（语义从「自然月 1 号」变为

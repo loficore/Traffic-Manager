@@ -21,6 +21,8 @@ pub const notify_template = @import("notify_template.zig");
 pub const quota = @import("quota.zig");
 pub const config_store = @import("config_store.zig");
 pub const http_server = @import("http_server.zig");
+/// 共享工具模块（parseTrafficUnit / resolveSocketPath），quota 亦 re-export 同名引用
+pub const common = @import("common.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -92,6 +94,20 @@ pub const AppConfig = struct {
     quota_adjustments: []QuotaAdjustmentArg = &.{},
     /// HTTP 服务器端口（0 = 不启动 HTTP 服务器）
     web_port: u16 = 0,
+    /// unix socket 监听路径（仅 --sqlite 模式生效；null = 启动时按默认规则解析）。
+    /// 仅存在于 CLI 层，不进 cfg.Config / SQLite config 表。
+    socket_path: ?[]const u8 = null,
+};
+
+/// 监控循环每周期顶部单锁快照的可实时调整标量（与 PUT /api/config 就地更新的
+/// 字段一一对应）：循环体内所有对这 5 个值的读取都走本轮快照，避免逐处加锁；
+/// interface/retention_days/day_count 保持重启生效，不进快照。
+const LiveScalars = struct {
+    interval_sec: u64,
+    quota_limit_bytes: u64,
+    quota_warning_threshold: f64,
+    quota_disconnect_threshold: f64,
+    reset_day: u8,
 };
 
 /// parseArgs 返回结果，包含合并后的配置和 CLI 来源信息
@@ -415,12 +431,19 @@ pub fn parseArgs(io: std.Io, allocator: Allocator, args_vec: std.process.Args) !
                 return error.InvalidArgumentValue;
             };
         }
+        // unix socket 监听路径（仅 --sqlite 生效；缺省由 resolveSocketPath 默认规则解析）
+        else if (std.mem.eql(u8, arg, "--socket")) {
+            const val_str = args.next() orelse {
+                std.debug.print("错误: --socket 选项缺少参数值\n", .{});
+                return error.MissingArgumentValue;
+            };
+            cli_config.socket_path = try allocator.dupe(u8, val_str);
+        }
         // 帮助
         else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             printHelp();
             std.process.exit(0);
         }
-
     }
 
     // 循环结束后固化仍挂起的最后一个配额调整
@@ -506,6 +529,7 @@ pub fn parseArgs(io: std.Io, allocator: Allocator, args_vec: std.process.Args) !
         // CLI 配额调整（不参与配置合并，直接透传）
         .quota_adjustments = cli_config.quota_adjustments,
         .web_port = cli_config.web_port,
+        .socket_path = cli_config.socket_path,
     };
 
     // Validate
@@ -557,6 +581,7 @@ fn printHelp() void {
         \\  --retention-days <天数>    历史记录保留天数（默认: 30）
         \\  --sqlite                   使用 SQLite 存储
         \\  --no-sqlite                禁用 SQLite 存储（默认）
+        \\  --socket <路径>            unix socket 监听路径（需配合 --sqlite）
         \\
         \\配额管理选项:
         \\  --quota-limit <大小>       月度流量配额（支持: 100GB, 500MB, 1TB）
@@ -637,6 +662,7 @@ pub fn main(init: std.process.Init) !void {
     defer if (app_config.smtp_pass) |p| init.gpa.free(p);
     defer if (app_config.smtp_from) |f| init.gpa.free(f);
     defer if (app_config.smtp_to) |t| init.gpa.free(t);
+    defer if (app_config.socket_path) |path| init.gpa.free(path);
 
     // ── Daemon 模式 ──────────────────────────────────────────────────────
     var io = init.io;
@@ -707,11 +733,17 @@ fn handleResume(io: std.Io, allocator: Allocator, config: *AppConfig) !void {
 var should_exit: std.atomic.Value(bool) = .init(false);
 /// 当前活跃的 PID 文件路径，信号处理器用此路径清理文件
 var active_pid_path: ?[]const u8 = null;
+/// 当前活跃的 unix socket 文件路径，进程退出前据此清理残留 socket 文件
+var active_socket_path: ?[]const u8 = null;
 
 fn signalHandler(_: std.posix.SIG) callconv(.c) void {
     // 清理 PID 文件
     if (active_pid_path) |path| {
         pidfile.removePidFile(path);
+    }
+    // 清理 unix socket 文件（避免下次启动时 bind 前残留陈旧文件）
+    if (active_socket_path) |path| {
+        http_server.removeSocketFile(path);
     }
     should_exit.store(true, .release);
 }
@@ -794,6 +826,13 @@ fn runDemo(io: std.Io, allocator: Allocator, config: *AppConfig, cli_source: cfg
     if (config.web_port > 0 and !config.use_sqlite) {
         std.debug.print("错误: --web-port 需要 SQLite 存储模式（请加 --sqlite 选项）\n", .{});
         return error.WebRequiresSqlite;
+    }
+
+    // unix socket 通道同样依赖 SQLite（HTTP 服务器共享 SQLite 连接与配置），
+    // 非 SQLite 模式请求 --socket 时明确拒绝启动，避免静默不可用。
+    if (config.socket_path != null and !config.use_sqlite) {
+        std.debug.print("错误: --socket 需要 SQLite 存储模式（请加 --sqlite 选项）\n", .{});
+        return error.SocketRequiresSqlite;
     }
 
     if (config.use_sqlite) {
@@ -881,7 +920,7 @@ fn runDemo(io: std.Io, allocator: Allocator, config: *AppConfig, cli_source: cfg
             config.quota_adjustments = &.{};
         }
 
-        try runLiveMonitorSqlite(io, allocator, config.*, &sqlite_stor);
+        try runLiveMonitorSqlite(io, allocator, config.*, &sqlite_stor, home_dir);
     } else {
         // 二进制文件存储模式
         // 配额调整仅支持 SQLite 模式，二进制模式下仅告警不报错
@@ -920,7 +959,44 @@ fn periodMonthKey(period: *const quota.PeriodInfo, buf: []u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}", .{ period.year, period.month }) catch null;
 }
 
+/// 初始化共享 live 配置：从启动合并后的 AppConfig 逐字段拷贝到进程生命期稳定的
+/// cfg.Config 对象。字符串字段经 ownConfigStrings 转为自持副本，使其不依赖
+/// AppConfig 中可能被释放的易失 slice；HTTP 线程与监控线程（todo 3）共用此对象。
+fn initLiveConfig(allocator: Allocator, app: AppConfig, live: *cfg.Config) !void {
+    live.* = .{
+        .interface = app.interface,
+        .interval_sec = app.interval_sec,
+        .daemon_mode = app.daemon_mode,
+        .foreground = app.foreground,
+        .use_sqlite = app.use_sqlite,
+        .retention_days = app.retention_days,
+        .log_file = app.log_file,
+        .pid_file = app.pid_file,
+        .list_only = app.list_only,
+        .day_count = app.day_count,
+        .quota_limit_bytes = app.quota_limit_bytes,
+        .quota_warning_threshold = app.quota_warning_threshold,
+        .quota_disconnect_threshold = app.quota_disconnect_threshold,
+        .webhook_url = app.webhook_url,
+        .smtp_server = app.smtp_server,
+        .smtp_port = app.smtp_port,
+        .smtp_user = app.smtp_user,
+        .smtp_pass = app.smtp_pass,
+        .smtp_from = app.smtp_from,
+        .smtp_to = app.smtp_to,
+        .restore_network = app.restore_network,
+        .reset_day = app.reset_day,
+    };
+    if (!http_server.ownConfigStrings(allocator, live)) return error.OutOfMemory;
+}
+
 fn runLiveMonitorFile(io: std.Io, allocator: Allocator, config: AppConfig, stor: ?*storage.Storage) !void {
+    // 共享 live 配置：进程生命周期内稳定的全字段配置。二进制存储模式当前不启动
+    // HTTP 服务器，此处保持与 SQLite 路径一致的初始化形态，为后续 socket 模式
+    // 复用同一指针设计预留（D3 决策）。
+    var live_cfg: cfg.Config = .{};
+    try initLiveConfig(allocator, config, &live_cfg);
+
     // 解析监听网卡
     const iface = if (config.interface) |name|
         try allocator.dupe(u8, name)
@@ -948,6 +1024,15 @@ fn runLiveMonitorFile(io: std.Io, allocator: Allocator, config: AppConfig, stor:
     var sample_count: u64 = 0;
 
     while (!should_exit.load(.acquire)) {
+        // 二进制路径无 HTTP 线程，配置不会并发变更：周期顶部直接快照 live 配置，
+        // 循环体统一走快照（与 SQLite 路径的 LiveScalars 语义一致）
+        const live = LiveScalars{
+            .interval_sec = live_cfg.interval_sec,
+            .quota_limit_bytes = live_cfg.quota_limit_bytes,
+            .quota_warning_threshold = live_cfg.quota_warning_threshold,
+            .quota_disconnect_threshold = live_cfg.quota_disconnect_threshold,
+            .reset_day = live_cfg.reset_day,
+        };
         const stats = tracker.update(iface, allocator, io) catch |err| {
             std.debug.print("采样失败: {s}\n", .{@errorName(err)});
             return err;
@@ -974,7 +1059,7 @@ fn runLiveMonitorFile(io: std.Io, allocator: Allocator, config: AppConfig, stor:
         }
 
         // 使用 clock_nanosleep（保证被信号中断，不会自动重启）
-        const sleep_ns: u64 = config.interval_sec * std.time.ns_per_s;
+        const sleep_ns: u64 = live.interval_sec * std.time.ns_per_s;
         var req = std.os.linux.timespec{ .sec = @intCast(@divTrunc(sleep_ns, std.time.ns_per_s)), .nsec = @intCast(@mod(sleep_ns, std.time.ns_per_s)) };
         var rem: std.os.linux.timespec = undefined;
         _ = std.os.linux.clock_nanosleep(.MONOTONIC, .{ .ABSTIME = false }, &req, &rem);
@@ -993,7 +1078,7 @@ fn runLiveMonitorFile(io: std.Io, allocator: Allocator, config: AppConfig, stor:
     }
 }
 
-fn runLiveMonitorSqlite(io: std.Io, allocator: Allocator, config: AppConfig, stor: *sqlite_storage.SQLiteStorage) !void {
+fn runLiveMonitorSqlite(io: std.Io, allocator: Allocator, config: AppConfig, stor: *sqlite_storage.SQLiteStorage, home_dir: ?[]const u8) !void {
     // 解析监听网卡
     const iface = if (config.interface) |name|
         try allocator.dupe(u8, name)
@@ -1047,18 +1132,25 @@ fn runLiveMonitorSqlite(io: std.Io, allocator: Allocator, config: AppConfig, sto
     try printOut(io, "  时间          ↓ 下行速率      ↑ 上行速率      ↓ PPS    ↑ PPS    累计下行        累计上行\n", .{});
     try printOut(io, "--------------------------------------------------------------\n", .{});
 
-    // ── 启动 HTTP 服务器（如果配置了端口） ──
-    var app_state = http_server.AppState{};
-    var http_thread: ?std.Thread = null;
-    if (config.web_port > 0) {
-        app_state.config = .{
-            .interval_sec = config.interval_sec,
-            .retention_days = config.retention_days,
-            .quota_limit_bytes = config.quota_limit_bytes,
-            .quota_warning_threshold = config.quota_warning_threshold,
-            .quota_disconnect_threshold = config.quota_disconnect_threshold,
-            .reset_day = config.reset_day,
-        };
+    // ── 共享 live 配置：进程生命周期内稳定的全字段配置 ──
+    // 从启动合并后的 config 拷贝全字段，字符串字段自持（ownConfigStrings 语义）。
+    // HTTP 线程据此指针就地更新（PUT /api/config）；监控线程读取同一个
+    // 对象，使配置变更运行时实时生效，无需重启。
+    var live_cfg: cfg.Config = .{};
+    try initLiveConfig(allocator, config, &live_cfg);
+
+    // ── 启动 HTTP 服务器（unix socket 恒定 + --web-port 可选 TCP） ──
+    // unix socket 仅在 --sqlite 监控循环路径绑定（D2 决策）：--socket 显式指定时
+    // 原样使用，否则按 resolveSocketPath 默认规则解析
+    //（XDG_RUNTIME_DIR 可写 → home/.local/run → /tmp）。解析失败视为启动致命错误。
+    const socket_path = common.resolveSocketPath(allocator, home_dir, config.socket_path) catch |err| {
+        std.debug.print("错误: 无法解析 unix socket 路径 ({s})，启动中止\n", .{@errorName(err)});
+        return err;
+    };
+    defer allocator.free(socket_path);
+    var app_state = http_server.AppState{ .config = &live_cfg };
+    // unix socket 恒开（resolveSocketPath 保证路径非空），故 --sqlite 模式下该块始终执行
+    {
         app_state.iface = iface;
         app_state.start_time_secs = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
 
@@ -1068,19 +1160,46 @@ fn runLiveMonitorSqlite(io: std.Io, allocator: Allocator, config: AppConfig, sto
             .conn = &stor.conn,
             .io = io,
             .port = config.web_port,
+            .socket_path = socket_path,
         };
-        http_thread = http_server.startHttpServer(ctx) catch |err| blk: {
-            std.debug.print("错误: HTTP 服务器启动失败（端口 {d} 可能被占用或不可用，错误: {s}），Web 仪表盘不可用\n", .{ config.web_port, @errorName(err) });
-            break :blk null;
+        // unix socket 绑定失败（SocketBindFailed）为启动致命错误（D4 决策），
+        // 显式报错并退出；TCP 等其它错误保持既有的 warn-and-continue 语义。
+        http_server.startHttpServer(ctx) catch |err| switch (err) {
+            error.SocketBindFailed => {
+                std.debug.print("错误: unix socket 绑定失败（{s}），启动中止\n", .{socket_path});
+                std.process.exit(1);
+            },
+            else => {
+                std.debug.print("错误: HTTP 服务器启动失败（端口 {d} 可能被占用或不可用，错误: {s}），Web 仪表盘不可用\n", .{ config.web_port, @errorName(err) });
+            },
         };
-        try printOut(io, "  HTTP 服务器: http://localhost:{d}/\n", .{config.web_port});
+        // 记录实际 socket 路径，供信号/正常退出路径清理（仿 active_pid_path 模式）
+        active_socket_path = socket_path;
+        if (config.web_port > 0) {
+            try printOut(io, "  HTTP 服务器: http://localhost:{d}/\n", .{config.web_port});
+        }
     }
+    // 正常退出路径清理 unix socket 文件（信号处理器已删除时为 no-op）
+    defer if (active_socket_path) |p| http_server.removeSocketFile(p);
 
     var time_buf: [16]u8 = undefined;
     var rx_speed_buf: [24]u8 = undefined;
     var tx_speed_buf: [24]u8 = undefined;
 
     while (!should_exit.load(.acquire)) {
+        // 每周期顶部单锁快照 5 个实时标量：循环内其余读取一律用本轮快照，
+        // 避免逐处加锁的锁竞争。PUT /api/config 写指针在锁内完成、saveAll 落库
+        // 在锁外，故此处锁占用时间极短（仅拷 5 个标量）。
+        app_state.mu.lock();
+        const live = LiveScalars{
+            .interval_sec = app_state.config.*.interval_sec,
+            .quota_limit_bytes = app_state.config.*.quota_limit_bytes,
+            .quota_warning_threshold = app_state.config.*.quota_warning_threshold,
+            .quota_disconnect_threshold = app_state.config.*.quota_disconnect_threshold,
+            .reset_day = app_state.config.*.reset_day,
+        };
+        app_state.mu.unlock();
+
         const stats = tracker.update(iface, allocator, io) catch |err| {
             std.debug.print("采样失败: {s}\n", .{@errorName(err)});
             return err;
@@ -1103,7 +1222,7 @@ fn runLiveMonitorSqlite(io: std.Io, allocator: Allocator, config: AppConfig, sto
         };
 
         // ── 配额检查（每分钟执行一次） ──
-        if (config.quota_limit_bytes > 0 and stats.timestamp_ms - last_quota_check_ms >= quota_check_interval_ms) {
+        if (live.quota_limit_bytes > 0 and stats.timestamp_ms - last_quota_check_ms >= quota_check_interval_ms) {
             last_quota_check_ms = stats.timestamp_ms;
 
             // 计算滚动预算周期：起始日与周期起始月（重置日语义，由 computePeriod 统一）
@@ -1112,7 +1231,7 @@ fn runLiveMonitorSqlite(io: std.Io, allocator: Allocator, config: AppConfig, sto
             const epoch_day = epoch_seconds.getEpochDay();
             const year_day = epoch_day.calculateYearDay();
             const month_day = year_day.calculateMonthDay();
-            const period = quota.computePeriod(config.reset_day, year_day.year, month_day.month.numeric(), month_day.day_index + 1);
+            const period = quota.computePeriod(live.reset_day, year_day.year, month_day.month.numeric(), month_day.day_index + 1);
 
             // 生成周期月份键（YYYY-MM），用于查询预算周期内配额调整记录
             var month_key_buf: [16]u8 = undefined;
@@ -1128,19 +1247,19 @@ fn runLiveMonitorSqlite(io: std.Io, allocator: Allocator, config: AppConfig, sto
             };
 
             // 获取当月有效配额（基础配额 + 临时调整）
-            const effective_quota = quota.getEffectiveMonthlyQuota(&stor.conn, config.quota_limit_bytes, month_key) catch |err| {
+            const effective_quota = quota.getEffectiveMonthlyQuota(&stor.conn, live.quota_limit_bytes, month_key) catch |err| {
                 log.warn("有效配额计算失败: {s}", .{@errorName(err)});
                 continue;
             };
             // 临时调整总额 = 有效配额 - 基础配额（饱和减法，防止下溢）
-            const adjustment_total = std.math.sub(u64, effective_quota, config.quota_limit_bytes) catch 0;
+            const adjustment_total = std.math.sub(u64, effective_quota, live.quota_limit_bytes) catch 0;
 
             // 检查配额状态
             const quota_config = quota.QuotaConfig{
                 .limit_bytes = effective_quota,
-                .warning_threshold = config.quota_warning_threshold,
-                .disconnect_threshold = config.quota_disconnect_threshold,
-                .reset_day = config.reset_day,
+                .warning_threshold = live.quota_warning_threshold,
+                .disconnect_threshold = live.quota_disconnect_threshold,
+                .reset_day = live.reset_day,
             };
             const current_state = quota.checkQuota(quota_config, monthly_traffic);
 
@@ -1154,12 +1273,12 @@ fn runLiveMonitorSqlite(io: std.Io, allocator: Allocator, config: AppConfig, sto
                     formatBytes(&tx_total_buf, effective_quota, ""),
                 });
 
-                // 发送通知
-                const base_quota = config.quota_limit_bytes;
+                // 发送通知（通知字符串在发送点加锁读取共享配置，见 sendQuotaNotification）
+                const base_quota = live.quota_limit_bytes;
                 sendQuotaNotification(
                     allocator,
                     io,
-                    config,
+                    &app_state,
                     iface,
                     monthly_traffic,
                     effective_quota,
@@ -1190,7 +1309,7 @@ fn runLiveMonitorSqlite(io: std.Io, allocator: Allocator, config: AppConfig, sto
         }
 
         // 使用 clock_nanosleep（保证被信号中断，不会自动重启）
-        const sleep_ns: u64 = config.interval_sec * std.time.ns_per_s;
+        const sleep_ns: u64 = live.interval_sec * std.time.ns_per_s;
         var req = std.os.linux.timespec{ .sec = @intCast(@divTrunc(sleep_ns, std.time.ns_per_s)), .nsec = @intCast(@mod(sleep_ns, std.time.ns_per_s)) };
         var rem: std.os.linux.timespec = undefined;
         _ = std.os.linux.clock_nanosleep(.MONOTONIC, .{ .ABSTIME = false }, &req, &rem);
@@ -1210,18 +1329,26 @@ fn runLiveMonitorSqlite(io: std.Io, allocator: Allocator, config: AppConfig, sto
 }
 
 /// 发送配额通知（通过 Webhook 和/或 SMTP）
+/// state 传入共享 AppState：通知字符串（webhook_url / smtp_*）在发送点加锁读取，
+/// 使 PUT /api/config 对通知地址的运行时修改即时生效（旧字符串按既有语义不释放，
+/// 快照出的 slice 在发送期间始终有效）。
 fn sendQuotaNotification(
     allocator: Allocator,
     io: std.Io,
-    config: AppConfig,
+    state: *http_server.AppState,
     iface: []const u8,
     used_bytes: u64,
     effective_quota: u64,
     base_quota: u64,
     adjustment_total: u64,
-    state: quota.QuotaState,
+    state_tag: quota.QuotaState,
 ) void {
     const timestamp_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
+
+    // 发送点单锁快照全部通知字段：仅在真正发通知时取锁，平常监控循环不为此加锁
+    state.mu.lock();
+    const notify_cfg = state.config.*;
+    state.mu.unlock();
 
     // 构建模板变量
     const vars = notify_template.TemplateVariables{
@@ -1238,7 +1365,7 @@ fn sendQuotaNotification(
     };
 
     // 选择模板
-    const template = switch (state) {
+    const template = switch (state_tag) {
         .warned => notify_template.default_warning_template,
         .exceeded => notify_template.default_disconnect_template,
         else => return, // normal/disabled 状态不发送通知
@@ -1252,7 +1379,7 @@ fn sendQuotaNotification(
     };
 
     // 通过 Webhook 发送
-    if (config.webhook_url) |url| {
+    if (notify_cfg.webhook_url) |url| {
         var notifier = webhook.WebhookNotifier.init(allocator, io, url);
         const result = notifier.sendTrafficAlert(
             iface,
@@ -1271,13 +1398,13 @@ fn sendQuotaNotification(
     }
 
     // 通过 SMTP 发送（如果配置了）
-    if (config.smtp_server) |server| {
+    if (notify_cfg.smtp_server) |server| {
         // 检查必要的 SMTP 配置
-        const from_addr = config.smtp_from orelse {
+        const from_addr = notify_cfg.smtp_from orelse {
             log.warn("SMTP: 缺少发件人地址 (--smtp-from)，跳过 SMTP 通知", .{});
             return;
         };
-        const to_addr = config.smtp_to orelse {
+        const to_addr = notify_cfg.smtp_to orelse {
             log.warn("SMTP: 缺少收件人地址 (--smtp-to)，跳过 SMTP 通知", .{});
             return;
         };
@@ -1289,7 +1416,7 @@ fn sendQuotaNotification(
         };
         defer allocator.free(zt_server);
 
-        const port_str = config.smtp_port orelse "25";
+        const port_str = notify_cfg.smtp_port orelse "25";
         const zt_port = allocator.dupeZ(u8, port_str) catch {
             log.err("SMTP: 内存分配失败", .{});
             return;
@@ -1305,7 +1432,7 @@ fn sendQuotaNotification(
             .none;
 
         // 根据用户名确定认证方式
-        const auth_method: smtp.AuthMethod = if (config.smtp_user != null)
+        const auth_method: smtp.AuthMethod = if (notify_cfg.smtp_user != null)
             .plain
         else
             .none;
@@ -1317,13 +1444,13 @@ fn sendQuotaNotification(
             if (zt_user) |u| allocator.free(u);
             if (zt_pass) |p| allocator.free(p);
         }
-        if (config.smtp_user) |user| {
+        if (notify_cfg.smtp_user) |user| {
             zt_user = allocator.dupeZ(u8, user) catch {
                 log.err("SMTP: 内存分配失败", .{});
                 return;
             };
         }
-        if (config.smtp_pass) |pass| {
+        if (notify_cfg.smtp_pass) |pass| {
             zt_pass = allocator.dupeZ(u8, pass) catch {
                 log.err("SMTP: 内存分配失败", .{});
                 return;
@@ -1343,7 +1470,7 @@ fn sendQuotaNotification(
         defer allocator.free(zt_to);
 
         // 根据状态生成邮件主题
-        const subject_str = switch (state) {
+        const subject_str = switch (state_tag) {
             .warned => "Traffic Manager: 配额警告",
             .exceeded => "Traffic Manager: 配额超限 - 已断网",
             else => "Traffic Manager: 通知",
@@ -1386,7 +1513,7 @@ fn sendQuotaNotification(
     var rx_buf: [24]u8 = undefined;
     var tx_buf: [24]u8 = undefined;
     log.info("[配额] {s}: {s} (已用: {s}/{s})", .{
-        @tagName(state),
+        @tagName(state_tag),
         iface,
         formatBytes(&rx_buf, used_bytes, ""),
         formatBytes(&tx_buf, effective_quota, ""),
